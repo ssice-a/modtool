@@ -6,12 +6,11 @@ from array import array
 
 import bpy
 
-from .common import is_mesh_object, run_object_operator, sync_edit_mesh_data
+from .common import is_mesh_object, sync_edit_mesh_data
 
 
 _TEMP_DELETE_MASK_NAME = "MDT_DeleteKeepShapeKeys"
 _TEMP_DELETE_GROUP_BASE = "__MDT_DELETE_KEEP__"
-_TEMP_APPLY_OBJECT_NAME = "__MDT_APPLY_MODIFIERS__"
 
 
 def has_shape_keys(obj):
@@ -112,148 +111,6 @@ def _restore_modifier_states(obj, modifier_states, skip_names=None):
         if modifier.name not in modifier_states:
             continue
         modifier.show_viewport = modifier_states[modifier.name]
-
-
-def _link_temp_object(context, obj):
-    temp_obj = obj.copy()
-    temp_obj.data = obj.data.copy()
-    temp_obj.name = _TEMP_APPLY_OBJECT_NAME
-    temp_obj.data.name = f"{obj.data.name}_AppliedPreview"
-    temp_obj.hide_viewport = False
-    temp_obj.hide_set(False)
-
-    target_collection = context.collection
-    if target_collection is None and obj.users_collection:
-        target_collection = obj.users_collection[0]
-    if target_collection is None:
-        raise ValueError("Could not find a collection for the temporary modifier apply object.")
-
-    target_collection.objects.link(temp_obj)
-    context.view_layer.update()
-    return temp_obj
-
-
-def _remove_temp_object(temp_obj):
-    if temp_obj is None:
-        return
-
-    temp_mesh = temp_obj.data
-    if temp_obj.name in bpy.data.objects:
-        bpy.data.objects.remove(temp_obj, do_unlink=True)
-    if temp_mesh is not None and temp_mesh.users == 0:
-        bpy.data.meshes.remove(temp_mesh)
-
-
-def _remove_all_shape_keys(context, obj):
-    if not has_shape_keys(obj):
-        return
-
-    result = run_object_operator(context, obj, "shape_key_remove", all=True)
-    if "FINISHED" not in result:
-        raise ValueError("Could not remove shape keys from the temporary modifier apply object.")
-
-
-def _apply_modifiers_on_object(context, obj, modifier_names):
-    applied_names = []
-    for modifier_name in modifier_names:
-        if obj.modifiers.get(modifier_name) is None:
-            continue
-
-        result = run_object_operator(
-            context,
-            obj,
-            "modifier_apply",
-            modifier=modifier_name,
-        )
-        if "FINISHED" not in result:
-            raise ValueError(f"Could not apply modifier '{modifier_name}'.")
-        applied_names.append(modifier_name)
-
-    if len(applied_names) != len(modifier_names):
-        missing_count = len(modifier_names) - len(applied_names)
-        raise ValueError(f"Could not find {missing_count} modifier(s) on the temporary apply object.")
-
-
-def _capture_vertex_group_info(obj):
-    return [
-        {
-            "name": group.name,
-            "lock_weight": bool(getattr(group, "lock_weight", False)),
-        }
-        for group in obj.vertex_groups
-    ]
-
-
-def _capture_vertex_group_weights(obj, group_count):
-    group_weights = [[] for _index in range(group_count)]
-
-    for vertex in obj.data.vertices:
-        vertex_index = vertex.index
-        for assignment in vertex.groups:
-            if assignment.group < 0 or assignment.group >= group_count:
-                continue
-            if assignment.weight <= 0.0:
-                continue
-            group_weights[assignment.group].append((vertex_index, float(assignment.weight)))
-
-    return group_weights
-
-
-def _clear_vertex_groups(obj):
-    while len(obj.vertex_groups) > 0:
-        obj.vertex_groups.remove(obj.vertex_groups[-1])
-
-
-def _restore_vertex_groups_from_snapshot(obj, group_info, group_weights):
-    target_names = [item["name"] for item in group_info]
-    current_names = [group.name for group in obj.vertex_groups]
-
-    if current_names == target_names:
-        for group, item in zip(obj.vertex_groups, group_info):
-            if hasattr(group, "lock_weight"):
-                group.lock_weight = item["lock_weight"]
-        return False
-
-    _clear_vertex_groups(obj)
-    for item in group_info:
-        group = obj.vertex_groups.new(name=item["name"])
-        if hasattr(group, "lock_weight"):
-            group.lock_weight = item["lock_weight"]
-
-    for group_index, weights in enumerate(group_weights):
-        if group_index >= len(obj.vertex_groups):
-            break
-        group = obj.vertex_groups[group_index]
-        for vertex_index, weight in weights:
-            group.add([vertex_index], weight, "REPLACE")
-
-    return True
-
-
-def _build_applied_modifier_snapshot(context, obj, modifier_names):
-    temp_obj = None
-    applied_mesh = None
-
-    try:
-        temp_obj = _link_temp_object(context, obj)
-        _remove_all_shape_keys(context, temp_obj)
-        _apply_modifiers_on_object(context, temp_obj, modifier_names)
-
-        group_info = _capture_vertex_group_info(temp_obj)
-        group_weights = _capture_vertex_group_weights(temp_obj, len(group_info))
-        applied_mesh = temp_obj.data.copy()
-        applied_mesh.name = obj.data.name
-        return {
-            "mesh": applied_mesh,
-            "group_info": group_info,
-            "group_weights": group_weights,
-        }
-    except Exception:
-        if applied_mesh is not None and applied_mesh.users == 0:
-            bpy.data.meshes.remove(applied_mesh)
-        raise
-    finally:
-        _remove_temp_object(temp_obj)
 
 
 def _unique_vertex_group_name(obj, base_name):
@@ -378,6 +235,24 @@ def _capture_flat_vertex_coordinates(obj, depsgraph, expected_vertex_count=None)
         return flat_coordinates, vertex_count
     finally:
         evaluated_obj.to_mesh_clear()
+
+
+def _create_evaluated_mesh_snapshot(obj, depsgraph):
+    evaluated_obj = obj.evaluated_get(depsgraph)
+    applied_mesh = bpy.data.meshes.new_from_object(
+        evaluated_obj,
+        preserve_all_data_layers=True,
+        depsgraph=depsgraph,
+    )
+    if applied_mesh is None:
+        raise ValueError("Could not build the evaluated modifier result.")
+    applied_mesh.name = obj.data.name
+    return applied_mesh
+
+
+def _apply_flat_coordinates_to_mesh(mesh, flat_coordinates):
+    mesh.vertices.foreach_set("co", flat_coordinates)
+    mesh.update()
 
 
 def _copy_action_settings(source_anim, target_anim):
@@ -545,24 +420,26 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
     old_mesh = obj.data
     old_shape_keys = getattr(old_mesh, "shape_keys", None)
     shape_key_info = _collect_shape_key_metadata(old_shape_keys)
-    old_group_info = _capture_vertex_group_info(obj)
-    old_group_weights = _capture_vertex_group_weights(obj, len(old_group_info))
     depsgraph = context.evaluated_depsgraph_get()
     flat_key_coordinates = []
-    applied_snapshot = None
     applied_mesh = None
     action_restore_info = {"action_copied": False, "driver_count": 0}
-    rebuilt_vertex_groups = False
 
     try:
         _set_capture_modifier_prefix(obj, target_index)
         context.view_layer.update()
 
+        applied_mesh = _create_evaluated_mesh_snapshot(obj, depsgraph)
+        expected_vertex_count = len(applied_mesh.vertices)
+
         _set_preview_shape(obj, 0)
         context.view_layer.update()
-        applied_snapshot = _build_applied_modifier_snapshot(context, obj, apply_modifier_names)
-        applied_mesh = applied_snapshot["mesh"]
-        expected_vertex_count = len(applied_mesh.vertices)
+        basis_coordinates, _basis_vertex_count = _capture_flat_vertex_coordinates(
+            obj,
+            depsgraph,
+            expected_vertex_count=expected_vertex_count,
+        )
+        _apply_flat_coordinates_to_mesh(applied_mesh, basis_coordinates)
 
         for key_info in shape_key_info["key_blocks"][1:]:
             _set_preview_shape(obj, key_info["index"])
@@ -579,7 +456,7 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         context.view_layer.update()
 
     if applied_mesh is None:
-        raise ValueError("Could not build the applied modifier snapshot.")
+        raise ValueError("Could not build the evaluated modifier result.")
 
     success = False
     try:
@@ -589,11 +466,6 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         context.view_layer.update()
 
         obj.data = applied_mesh
-        rebuilt_vertex_groups = _restore_vertex_groups_from_snapshot(
-            obj,
-            applied_snapshot["group_info"],
-            applied_snapshot["group_weights"],
-        )
         _rebuild_shape_keys(obj, shape_key_info, flat_key_coordinates)
         _restore_new_runtime_state(obj, runtime_state)
 
@@ -612,7 +484,6 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         if not success:
             if obj.data == applied_mesh:
                 obj.data = old_mesh
-                _restore_vertex_groups_from_snapshot(obj, old_group_info, old_group_weights)
             _restore_runtime_state(obj, runtime_state)
             _restore_modifier_states(obj, original_modifier_states)
             context.view_layer.update()
@@ -627,7 +498,6 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         "shape_key_count": max(0, len(shape_key_info["key_blocks"]) - 1),
         "vertex_count": len(obj.data.vertices),
         "vertex_group_count": len(obj.vertex_groups),
-        "rebuilt_vertex_groups": rebuilt_vertex_groups,
         "action_copied": action_restore_info["action_copied"],
         "driver_count": action_restore_info["driver_count"],
     }

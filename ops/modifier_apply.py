@@ -93,7 +93,6 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
         total_modifier_count = sum(len(result["applied_modifier_names"]) for _obj_name, result in results)
         total_shape_key_count = sum(result["shape_key_count"] for _obj_name, result in results)
         total_vertex_group_count = sum(result["vertex_group_count"] for _obj_name, result in results)
-        rebuilt_group_count = sum(1 for _obj_name, result in results if result["rebuilt_vertex_groups"])
         action_count = sum(1 for _obj_name, result in results if result["action_copied"])
         driver_count = sum(result["driver_count"] for _obj_name, result in results)
 
@@ -102,9 +101,7 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
             f"Preserved {total_shape_key_count} shape key(s)."
         )
         if total_vertex_group_count > 0:
-            message += f" Kept {total_vertex_group_count} vertex group(s)."
-        if rebuilt_group_count > 0:
-            message += f" Rebuilt vertex-group names/weights on {rebuilt_group_count} object(s)."
+            message += f" Baked evaluated data for {total_vertex_group_count} vertex group(s)."
         if action_count > 0:
             message += f" Reattached actions on {action_count} object(s)."
         if driver_count > 0:
