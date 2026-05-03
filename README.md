@@ -6,9 +6,12 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 
 - Vertex-group renaming with rule-based and sequential modes
 - Shape-key transfer between overlapping meshes with different vertex counts
-- Seam mapping analysis and seam-weight transfer between meshes
+- Shape-key-safe deletion for selected mesh geometry
+- Shape-key-safe modifier apply for enabled modifiers, including data-transfer and vertex-group edits
+- One-click seam vertex-group renaming from the active mesh to the selected meshes
 - One-click material creation from object names
 - Split selected meshes by material and rename the pieces automatically
+- Armature FK cleanup that keeps weighted bones, removes control bones, strips pose constraints, and unlocks pose transforms
 
 ## Usage
 
@@ -19,13 +22,13 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 ## Panels
 
 - `Vertex Groups`
-  Rename the active mesh object's vertex groups and preview the result before applying it.
-- `Seam Transfer`
-  Analyze seam matches between two meshes, review the stored mapping list, and apply seam-weight transfer.
+  Rename the active mesh object's vertex groups, clean empty groups, map group names, and rename selected seam groups to the active mesh.
 - `Shape Keys`
-  Transfer all shape keys from one overlapping mesh surface to another mesh, even when the vertex counts differ.
+  Transfer shape keys between overlapping meshes, delete selected geometry, and apply enabled modifiers while preserving existing shape keys.
 - `Materials`
   Create one material per selected object or split selected objects by their material slots.
+- `Armature`
+  Convert a rig to a direct FK skeleton by keeping bones with weighted matching vertex groups, removing unweighted bones, clearing pose constraints, and unlocking pose transforms.
 
 ## Code Layout
 

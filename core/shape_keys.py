@@ -9,7 +9,7 @@ import bpy
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-from .common import is_mesh_object, sync_edit_mesh_data
+from .common import is_mesh_object, run_object_operator, sync_edit_mesh_data
 
 
 _TRIANGLE_RELATIVE_EPSILON = 1.0e-12
@@ -995,29 +995,8 @@ def _capture_evaluated_vertex_coordinates(obj, depsgraph):
         evaluated_obj.to_mesh_clear()
 
 
-def _run_object_operator(context, active_obj, operator_name, **kwargs):
-    view_layer = context.view_layer
-    previous_active = view_layer.objects.active
-    previous_selected = list(getattr(context, "selected_objects", []))
-
-    try:
-        for obj in previous_selected:
-            obj.select_set(False)
-        active_obj.select_set(True)
-        view_layer.objects.active = active_obj
-        return getattr(bpy.ops.object, operator_name)(**kwargs)
-    finally:
-        for obj in list(getattr(context, "selected_objects", [])):
-            obj.select_set(False)
-        for obj in previous_selected:
-            if view_layer.objects.get(obj.name) is not None:
-                obj.select_set(True)
-        if previous_active is not None and view_layer.objects.get(previous_active.name) is not None:
-            view_layer.objects.active = previous_active
-
-
 def _bind_surface_deform_modifier(context, target_obj, modifier_name):
-    result = _run_object_operator(
+    result = run_object_operator(
         context,
         target_obj,
         "surfacedeform_bind",

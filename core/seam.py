@@ -1,62 +1,18 @@
-"""Seam matching and weight-transfer helpers for Mod Tool."""
+"""Seam-based vertex-group rename helpers for Mod Tool."""
 
 from __future__ import annotations
 
 from math import floor
 
 from .common import is_mesh_object, sync_edit_mesh_data
+from .rename import apply_exact_name_pairs
 
+
+DEFAULT_MATCH_TOLERANCE = 1.0e-4
+DEFAULT_WEIGHT_TOLERANCE = 0.02
 
 _WEIGHT_EPSILON = 1.0e-8
 _MAPPING_WEIGHT_FLOOR = 1.0e-4
-
-
-def count_enabled_group_mappings(scene):
-    """Return how many stored mappings are currently enabled."""
-    return sum(1 for item in scene.mdt_group_mappings if item.enabled)
-
-
-def _sanitize_source_target_pair(source_obj, target_obj):
-    if not is_mesh_object(source_obj):
-        source_obj = None
-    if not is_mesh_object(target_obj):
-        target_obj = None
-    if source_obj is not None and target_obj is not None and source_obj == target_obj:
-        return source_obj, None
-    return source_obj, target_obj
-
-
-def resolve_mapping_objects(context, settings):
-    """Resolve analysis meshes from the UI settings, with selection fallback."""
-    source_obj = getattr(settings, "source_object", None)
-    target_obj = getattr(settings, "target_object", None)
-    active_obj = context.object
-    selected_meshes = [obj for obj in getattr(context, "selected_objects", []) if is_mesh_object(obj)]
-
-    if not is_mesh_object(source_obj) and is_mesh_object(active_obj):
-        source_obj = active_obj
-
-    if not is_mesh_object(target_obj):
-        candidates = [obj for obj in selected_meshes if obj != source_obj]
-        if len(candidates) == 1:
-            target_obj = candidates[0]
-
-    return _sanitize_source_target_pair(source_obj, target_obj)
-
-
-def resolve_apply_objects(context, settings):
-    """Resolve apply meshes, falling back to the analysis pair when blank."""
-    apply_source_obj = getattr(settings, "apply_source_object", None)
-    apply_target_obj = getattr(settings, "apply_target_object", None)
-
-    if not is_mesh_object(apply_source_obj) or not is_mesh_object(apply_target_obj):
-        fallback_source, fallback_target = resolve_mapping_objects(context, settings)
-        if not is_mesh_object(apply_source_obj):
-            apply_source_obj = fallback_source
-        if not is_mesh_object(apply_target_obj):
-            apply_target_obj = fallback_target
-
-    return _sanitize_source_target_pair(apply_source_obj, apply_target_obj)
 
 
 def _resolve_boundary_vertex_indices(obj):
@@ -154,36 +110,12 @@ def build_vertex_pairs(source_vertices, target_vertices, tolerance):
     return matched_pairs, unmatched_source, unmatched_target
 
 
-def _resolve_deform_group_names(obj):
-    deform_group_names = set()
-    for modifier in obj.modifiers:
-        if modifier.type != "ARMATURE" or modifier.object is None:
-            continue
-        if getattr(modifier.object, "type", None) != "ARMATURE":
-            continue
-        for bone in modifier.object.data.bones:
-            if bone.use_deform:
-                deform_group_names.add(bone.name)
-    return deform_group_names
-
-
-def resolve_syncable_group_names(source_obj, target_obj, only_deform_groups):
-    """Return the shared group scope used for seam analysis and apply."""
-    if not only_deform_groups:
-        return None
-
-    deform_group_names = _resolve_deform_group_names(source_obj) | _resolve_deform_group_names(target_obj)
-    return deform_group_names or None
-
-
-def read_vertex_weights(obj, vertex_index, syncable_group_names=None):
-    """Read the weight assignments for one vertex."""
+def read_vertex_weights(obj, vertex_index):
+    """Read positive vertex-group weights from one vertex."""
     weight_map = {}
     vertex = obj.data.vertices[vertex_index]
     for assignment in vertex.groups:
         group_name = obj.vertex_groups[assignment.group].name
-        if syncable_group_names is not None and group_name not in syncable_group_names:
-            continue
         if assignment.weight > _WEIGHT_EPSILON:
             weight_map[group_name] = assignment.weight
     return weight_map
@@ -232,15 +164,13 @@ def _accumulate_mapping_candidates(candidate_stats, source_items, target_items, 
         stats["votes"] += 1
 
 
-def build_mapping_candidates(source_obj, target_obj, matched_pairs, syncable_group_names, weight_tolerance):
-    """Infer cross-object vertex-group mappings from nearby seam vertices with similar weights."""
+def build_mapping_candidates(source_obj, target_obj, matched_pairs, weight_tolerance):
+    """Infer source-to-target vertex-group rename candidates from matching seam weights."""
     candidate_stats = {}
 
     for source_index, target_index in matched_pairs:
-        source_weights = read_vertex_weights(source_obj, source_index, syncable_group_names)
-        target_weights = read_vertex_weights(target_obj, target_index, syncable_group_names)
-        source_items = _sorted_weight_items(source_weights)
-        target_items = _sorted_weight_items(target_weights)
+        source_items = _sorted_weight_items(read_vertex_weights(source_obj, source_index))
+        target_items = _sorted_weight_items(read_vertex_weights(target_obj, target_index))
 
         if not source_items or not target_items:
             continue
@@ -248,11 +178,11 @@ def build_mapping_candidates(source_obj, target_obj, matched_pairs, syncable_gro
         _accumulate_mapping_candidates(candidate_stats, source_items, target_items, weight_tolerance)
 
     candidates = []
-    for (group_a, group_b), stats in candidate_stats.items():
+    for (source_group, target_group), stats in candidate_stats.items():
         candidates.append(
             {
-                "group_a": group_a,
-                "group_b": group_b,
+                "source_group": source_group,
+                "target_group": target_group,
                 "score": stats["score"],
                 "vote_count": stats["votes"],
             }
@@ -262,104 +192,87 @@ def build_mapping_candidates(source_obj, target_obj, matched_pairs, syncable_gro
         key=lambda item: (
             item["vote_count"],
             item["score"],
-            item["group_a"] == item["group_b"],
+            item["source_group"] == item["target_group"],
         ),
         reverse=True,
     )
 
-    used_group_a = set()
-    used_group_b = set()
+    used_source_groups = set()
+    used_target_groups = set()
     mappings = []
     for candidate in candidates:
-        if candidate["group_a"] in used_group_a or candidate["group_b"] in used_group_b:
+        if candidate["source_group"] in used_source_groups or candidate["target_group"] in used_target_groups:
             continue
 
-        used_group_a.add(candidate["group_a"])
-        used_group_b.add(candidate["group_b"])
+        used_source_groups.add(candidate["source_group"])
+        used_target_groups.add(candidate["target_group"])
         mappings.append(candidate)
 
     return mappings
 
 
-def store_group_mappings(scene, mappings):
-    """Write mapping results back to the Blender scene collection."""
-    scene.mdt_group_mappings.clear()
-    for mapping in mappings:
-        item = scene.mdt_group_mappings.add()
-        item.enabled = True
-        item.group_a = mapping["group_a"]
-        item.group_b = mapping["group_b"]
-        item.score = mapping["score"]
-        item.vote_count = mapping["vote_count"]
-
-    if len(scene.mdt_group_mappings) == 0:
-        scene.mdt_active_group_mapping_index = 0
-    else:
-        scene.mdt_active_group_mapping_index = min(
-            scene.mdt_active_group_mapping_index,
-            len(scene.mdt_group_mappings) - 1,
-        )
-
-
-def _get_or_create_vertex_group(obj, group_name):
-    vertex_group = obj.vertex_groups.get(group_name)
-    if vertex_group is None:
-        vertex_group = obj.vertex_groups.new(name=group_name)
-    return vertex_group
-
-
-def _clear_vertex_weights(obj, vertex_index, group_names):
-    for group_name in group_names:
-        vertex_group = obj.vertex_groups.get(group_name)
-        if vertex_group is not None:
-            vertex_group.remove([vertex_index])
-
-
-def _write_vertex_weights(obj, vertex_index, weight_map, group_names_to_clear):
-    _clear_vertex_weights(obj, vertex_index, group_names_to_clear)
-    for group_name, weight in weight_map.items():
-        if weight <= _WEIGHT_EPSILON:
-            continue
-        vertex_group = _get_or_create_vertex_group(obj, group_name)
-        vertex_group.add([vertex_index], weight, "REPLACE")
-
-
-def resolve_enabled_mapping_direction(scene, source_obj, invert_mapping=False):
-    """Resolve stored mappings into explicit source-to-target pairs for apply."""
-    resolved_mappings = []
-    skipped_missing_source_groups = 0
-
-    for item in scene.mdt_group_mappings:
-        if not item.enabled or not item.group_a or not item.group_b:
-            continue
-
-        source_group = item.group_b if invert_mapping else item.group_a
-        target_group = item.group_a if invert_mapping else item.group_b
-        if source_obj.vertex_groups.get(source_group) is None:
-            skipped_missing_source_groups += 1
-            continue
-
-        resolved_mappings.append((source_group, target_group))
-
-    return resolved_mappings, skipped_missing_source_groups
-
-
-def apply_weights_to_vertex(
+def build_seam_rename_pairs(
     source_obj,
-    source_index,
     target_obj,
-    target_index,
-    mappings,
-    target_groups_to_clear,
-    syncable_group_names=None,
+    target_seam_vertices=None,
+    match_tolerance=DEFAULT_MATCH_TOLERANCE,
+    weight_tolerance=DEFAULT_WEIGHT_TOLERANCE,
 ):
-    """Copy mapped source seam weights to the paired vertex on the target seam."""
-    source_weights = read_vertex_weights(source_obj, source_index, syncable_group_names)
-    payload = {}
+    """Build exact source-to-target vertex-group rename pairs from paired seam vertices."""
+    if not is_mesh_object(source_obj) or not is_mesh_object(target_obj):
+        raise ValueError("Choose valid mesh objects.")
+    if source_obj == target_obj:
+        raise ValueError("Source and target objects must be different.")
+    if match_tolerance <= 0.0:
+        raise ValueError("Match tolerance must be greater than zero.")
+    if weight_tolerance <= 0.0:
+        raise ValueError("Weight tolerance must be greater than zero.")
 
-    for source_group, target_group in mappings:
-        weight = source_weights.get(source_group, 0.0)
-        if weight > _WEIGHT_EPSILON:
-            payload[target_group] = weight
+    source_seam_vertices = collect_seam_vertices(source_obj)
+    if target_seam_vertices is None:
+        target_seam_vertices = collect_seam_vertices(target_obj)
 
-    _write_vertex_weights(target_obj, target_index, payload, target_groups_to_clear)
+    if not source_seam_vertices:
+        raise ValueError(f"{source_obj.name} has no open-boundary seam vertices.")
+    if not target_seam_vertices:
+        raise ValueError(f"{target_obj.name} has no open-boundary seam vertices.")
+
+    matched_pairs, unmatched_source, unmatched_target = build_vertex_pairs(
+        source_seam_vertices,
+        target_seam_vertices,
+        match_tolerance,
+    )
+    if not matched_pairs:
+        raise ValueError(f"{source_obj.name} has no seam vertices matching {target_obj.name}.")
+
+    mappings = build_mapping_candidates(source_obj, target_obj, matched_pairs, weight_tolerance)
+    if not mappings:
+        raise ValueError(f"{source_obj.name} has no seam-weight names that match {target_obj.name}.")
+
+    return {
+        "rename_pairs": [(item["source_group"], item["target_group"]) for item in mappings],
+        "mapping_count": len(mappings),
+        "matched_pair_count": len(matched_pairs),
+        "unmatched_source_count": len(unmatched_source),
+        "unmatched_target_count": len(unmatched_target),
+    }
+
+
+def rename_seam_groups_to_target(
+    source_obj,
+    target_obj,
+    target_seam_vertices=None,
+    match_tolerance=DEFAULT_MATCH_TOLERANCE,
+    weight_tolerance=DEFAULT_WEIGHT_TOLERANCE,
+):
+    """Rename source seam vertex groups to the matched names on the target object."""
+    analysis = build_seam_rename_pairs(
+        source_obj,
+        target_obj,
+        target_seam_vertices=target_seam_vertices,
+        match_tolerance=match_tolerance,
+        weight_tolerance=weight_tolerance,
+    )
+    result = apply_exact_name_pairs(source_obj, analysis["rename_pairs"])
+    analysis.update(result)
+    return analysis

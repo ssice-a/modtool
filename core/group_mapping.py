@@ -543,56 +543,11 @@ def apply_group_mapping_rename(source_obj, mapping_items):
     if not is_mesh_object(source_obj):
         raise ValueError("Choose a valid source mesh.")
 
-    source_groups_by_name = {group.name: group for group in source_obj.vertex_groups}
-    raw_pairs = []
-    skipped_missing = 0
+    from .rename import apply_exact_name_pairs
 
-    for item in mapping_items:
-        if item.status not in {"DIRECT", "MANUAL"} or not item.source_group or not item.target_group:
-            continue
-        source_group = source_groups_by_name.get(item.source_group)
-        if source_group is None:
-            skipped_missing += 1
-            continue
-        if source_group.name == item.target_group:
-            continue
-        raw_pairs.append((source_group, item.target_group))
-
-    if not raw_pairs:
-        return {
-            "renamed_count": 0,
-            "skipped_conflict_count": 0,
-            "skipped_missing_count": skipped_missing,
-        }
-
-    rename_source_names = {group.name for group, _target_name in raw_pairs}
-    existing_names = {group.name for group in source_obj.vertex_groups}
-    used_target_names = set()
-    resolved_pairs = []
-    skipped_conflict_count = 0
-
-    for group, target_name in raw_pairs:
-        if target_name in used_target_names:
-            skipped_conflict_count += 1
-            continue
-        if target_name in existing_names and target_name not in rename_source_names:
-            skipped_conflict_count += 1
-            continue
-        used_target_names.add(target_name)
-        resolved_pairs.append((group, target_name))
-
-    if not resolved_pairs:
-        return {
-            "renamed_count": 0,
-            "skipped_conflict_count": skipped_conflict_count,
-            "skipped_missing_count": skipped_missing,
-        }
-
-    from .rename import apply_rename_plan
-
-    renamed_count = apply_rename_plan(resolved_pairs)
-    return {
-        "renamed_count": renamed_count,
-        "skipped_conflict_count": skipped_conflict_count,
-        "skipped_missing_count": skipped_missing,
-    }
+    name_pairs = [
+        (item.source_group, item.target_group)
+        for item in mapping_items
+        if item.status in {"DIRECT", "MANUAL"} and item.source_group and item.target_group
+    ]
+    return apply_exact_name_pairs(source_obj, name_pairs)

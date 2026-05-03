@@ -138,42 +138,6 @@ class MDT_PG_GroupMatchSettings(bpy.types.PropertyGroup):
     )
 
 
-class MDT_PG_GroupMappingItem(bpy.types.PropertyGroup):
-    """One inferred cross-object vertex-group mapping."""
-
-    enabled: bpy.props.BoolProperty(
-        name="Enabled",
-        description="Use this mapping when copying source seam weights to the target seam",
-        default=True,
-    )
-
-    group_a: bpy.props.StringProperty(
-        name="Group A",
-        description="Vertex group on the first matched side",
-        default="",
-    )
-
-    group_b: bpy.props.StringProperty(
-        name="Group B",
-        description="Vertex group on the second matched side",
-        default="",
-    )
-
-    score: bpy.props.FloatProperty(
-        name="Score",
-        description="Accumulated similarity score for this mapping",
-        default=0.0,
-        precision=6,
-    )
-
-    vote_count: bpy.props.IntProperty(
-        name="Votes",
-        description="How many matched vertex pairs supported this mapping",
-        default=0,
-        min=0,
-    )
-
-
 class MDT_PG_GroupMatchResultItem(bpy.types.PropertyGroup):
     """One source-to-target rename suggestion inferred from mesh analysis."""
 
@@ -235,68 +199,6 @@ class MDT_PG_GroupMatchResultItem(bpy.types.PropertyGroup):
         name="Reason",
         description="Short explanation for the current mapping status",
         default="",
-    )
-
-
-class MDT_PG_SeamSettings(bpy.types.PropertyGroup):
-    """Settings used for seam-based mapping and weight copy."""
-
-    source_object: bpy.props.PointerProperty(
-        name="Analyze Source",
-        description="Source mesh whose seam is used to infer mappings",
-        type=bpy.types.Object,
-        poll=_mesh_object_poll,
-    )
-
-    target_object: bpy.props.PointerProperty(
-        name="Analyze Target",
-        description="Target mesh whose seam is compared during mapping analysis",
-        type=bpy.types.Object,
-        poll=_mesh_object_poll,
-    )
-
-    apply_source_object: bpy.props.PointerProperty(
-        name="Apply Source",
-        description="Source mesh whose seam weights will be copied during apply",
-        type=bpy.types.Object,
-        poll=_mesh_object_poll,
-    )
-
-    apply_target_object: bpy.props.PointerProperty(
-        name="Apply Target",
-        description="Target mesh whose seam weights will be overwritten during apply",
-        type=bpy.types.Object,
-        poll=_mesh_object_poll,
-    )
-
-    invert_mapping: bpy.props.BoolProperty(
-        name="Reverse Mapping",
-        description="Apply the stored group mapping in reverse",
-        default=False,
-    )
-
-    match_tolerance: bpy.props.FloatProperty(
-        name="Match Tolerance",
-        description="Maximum world-space distance allowed when pairing seam vertices across the two objects",
-        default=0.0001,
-        min=0.000001,
-        soft_min=0.000001,
-        precision=6,
-    )
-
-    weight_tolerance: bpy.props.FloatProperty(
-        name="Weight Tolerance",
-        description="Maximum weight difference allowed when inferring a group mapping from a matched seam vertex pair",
-        default=0.02,
-        min=0.0001,
-        max=1.0,
-        precision=4,
-    )
-
-    only_deform_groups: bpy.props.BoolProperty(
-        name="Deform Only",
-        description="Only consider vertex groups that match deform bones from armature modifiers",
-        default=True,
     )
 
 
@@ -376,9 +278,7 @@ class MDT_PG_ShapeKeyTransferSettings(bpy.types.PropertyGroup):
 REGISTERED_CLASSES = (
     MDT_PG_RenameSettings,
     MDT_PG_GroupMatchSettings,
-    MDT_PG_GroupMappingItem,
     MDT_PG_GroupMatchResultItem,
-    MDT_PG_SeamSettings,
     MDT_PG_ShapeKeyTransferSettings,
 )
 
@@ -387,12 +287,9 @@ def register_addon_properties():
     """Register addon PointerProperties and collections on Scene."""
     bpy.types.Scene.mdt_rename_settings = bpy.props.PointerProperty(type=MDT_PG_RenameSettings)
     bpy.types.Scene.mdt_group_match_settings = bpy.props.PointerProperty(type=MDT_PG_GroupMatchSettings)
-    bpy.types.Scene.mdt_seam_settings = bpy.props.PointerProperty(type=MDT_PG_SeamSettings)
     bpy.types.Scene.mdt_shape_key_settings = bpy.props.PointerProperty(type=MDT_PG_ShapeKeyTransferSettings)
     bpy.types.Scene.mdt_group_match_results = bpy.props.CollectionProperty(type=MDT_PG_GroupMatchResultItem)
     bpy.types.Scene.mdt_active_group_match_result_index = bpy.props.IntProperty(default=0, min=0)
-    bpy.types.Scene.mdt_group_mappings = bpy.props.CollectionProperty(type=MDT_PG_GroupMappingItem)
-    bpy.types.Scene.mdt_active_group_mapping_index = bpy.props.IntProperty(default=0, min=0)
 
 
 def unregister_addon_properties():
@@ -401,14 +298,8 @@ def unregister_addon_properties():
         del bpy.types.Scene.mdt_active_group_match_result_index
     if hasattr(bpy.types.Scene, "mdt_group_match_results"):
         del bpy.types.Scene.mdt_group_match_results
-    if hasattr(bpy.types.Scene, "mdt_active_group_mapping_index"):
-        del bpy.types.Scene.mdt_active_group_mapping_index
-    if hasattr(bpy.types.Scene, "mdt_group_mappings"):
-        del bpy.types.Scene.mdt_group_mappings
     if hasattr(bpy.types.Scene, "mdt_shape_key_settings"):
         del bpy.types.Scene.mdt_shape_key_settings
-    if hasattr(bpy.types.Scene, "mdt_seam_settings"):
-        del bpy.types.Scene.mdt_seam_settings
     if hasattr(bpy.types.Scene, "mdt_group_match_settings"):
         del bpy.types.Scene.mdt_group_match_settings
     if hasattr(bpy.types.Scene, "mdt_rename_settings"):

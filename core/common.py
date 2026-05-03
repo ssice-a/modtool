@@ -6,8 +6,10 @@ import bpy
 
 
 _MODE_RESTORE_MAP = {
+    "EDIT_ARMATURE": "EDIT",
     "EDIT_MESH": "EDIT",
     "OBJECT": "OBJECT",
+    "POSE": "POSE",
     "SCULPT": "SCULPT",
     "VERTEX_PAINT": "VERTEX_PAINT",
     "WEIGHT_PAINT": "WEIGHT_PAINT",
@@ -49,3 +51,25 @@ def restore_context_mode(previous_mode):
         bpy.ops.object.mode_set(mode=restore_mode)
     except RuntimeError:
         pass
+
+
+def run_object_operator(context, active_obj, operator_name, **kwargs):
+    """Run an object operator with a temporary active selection and restore the user's selection."""
+    view_layer = context.view_layer
+    previous_active = view_layer.objects.active
+    previous_selected = list(getattr(context, "selected_objects", []))
+
+    try:
+        for obj in previous_selected:
+            obj.select_set(False)
+        active_obj.select_set(True)
+        view_layer.objects.active = active_obj
+        return getattr(bpy.ops.object, operator_name)(**kwargs)
+    finally:
+        for obj in list(getattr(context, "selected_objects", [])):
+            obj.select_set(False)
+        for obj in previous_selected:
+            if view_layer.objects.get(obj.name) is not None:
+                obj.select_set(True)
+        if previous_active is not None and view_layer.objects.get(previous_active.name) is not None:
+            view_layer.objects.active = previous_active

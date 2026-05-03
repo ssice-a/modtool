@@ -2,193 +2,33 @@
 
 import bpy
 
-from ..core.common import ensure_object_mode, is_mesh_object, restore_context_mode
-from ..core.seam import (
-    apply_weights_to_vertex,
-    build_mapping_candidates,
-    build_vertex_pairs,
-    collect_seam_vertices,
-    resolve_apply_objects,
-    resolve_enabled_mapping_direction,
-    resolve_mapping_objects,
-    resolve_syncable_group_names,
-    store_group_mappings,
-)
+from ..core.common import ensure_object_mode, get_selected_mesh_objects, is_mesh_object, restore_context_mode
+from ..core.seam import collect_seam_vertices, rename_seam_groups_to_target
 
 
-class MDT_OT_analyze_seam_mapping(bpy.types.Operator):
-    """Analyze nearby seam vertex pairs and infer cross-object group mappings."""
+class MDT_OT_rename_selected_seam_groups(bpy.types.Operator):
+    """Rename selected meshes' seam vertex groups to matching names from the active mesh."""
 
-    bl_idname = "mdt.analyze_seam_mapping"
-    bl_label = "Analyze Mapping"
-    bl_description = "Pair nearby seam vertices and infer which vertex groups correspond across both objects"
+    bl_idname = "mdt.rename_selected_seam_groups"
+    bl_label = "Rename Seams To Active"
+    bl_description = "Rename seam vertex groups on selected meshes to matching names from the active mesh"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
-    def poll(cls, _context):
-        return True
+    def poll(cls, context):
+        active_obj = context.object
+        return is_mesh_object(active_obj) and len(get_selected_mesh_objects(context)) > 1
 
     def execute(self, context):
-        settings = context.scene.mdt_seam_settings
-        source_obj, target_obj = resolve_mapping_objects(context, settings)
-
-        if not is_mesh_object(source_obj):
-            self.report({"ERROR"}, "Choose a valid analysis source mesh.")
-            return {"CANCELLED"}
-
+        target_obj = context.object
         if not is_mesh_object(target_obj):
-            self.report({"ERROR"}, "Choose a valid analysis target mesh.")
+            self.report({"ERROR"}, "Choose an active mesh object as the naming target.")
             return {"CANCELLED"}
 
-        if source_obj == target_obj:
-            self.report({"ERROR"}, "Source and target objects must be different.")
+        source_objects = [obj for obj in get_selected_mesh_objects(context) if obj != target_obj]
+        if not source_objects:
+            self.report({"ERROR"}, "Select at least one more mesh object to rename.")
             return {"CANCELLED"}
-
-        source_seam_vertices = collect_seam_vertices(source_obj)
-        target_seam_vertices = collect_seam_vertices(target_obj)
-
-        if not source_seam_vertices:
-            store_group_mappings(context.scene, [])
-            self.report({"ERROR"}, "The source object has no open-boundary seam vertices.")
-            return {"CANCELLED"}
-
-        if not target_seam_vertices:
-            store_group_mappings(context.scene, [])
-            self.report({"ERROR"}, "The target object has no open-boundary seam vertices.")
-            return {"CANCELLED"}
-
-        matched_pairs, unmatched_source, unmatched_target = build_vertex_pairs(
-            source_seam_vertices,
-            target_seam_vertices,
-            settings.match_tolerance,
-        )
-
-        if not matched_pairs:
-            store_group_mappings(context.scene, [])
-            self.report({"ERROR"}, "No nearby seam vertex pairs were found. Increase Match Tolerance.")
-            return {"CANCELLED"}
-
-        syncable_group_names = resolve_syncable_group_names(
-            source_obj,
-            target_obj,
-            settings.only_deform_groups,
-        )
-        mappings = build_mapping_candidates(
-            source_obj,
-            target_obj,
-            matched_pairs,
-            syncable_group_names,
-            settings.weight_tolerance,
-        )
-        store_group_mappings(context.scene, mappings)
-
-        if not mappings:
-            self.report(
-                {"ERROR"},
-                "No group mappings were inferred from the seam pairs. Increase Weight Tolerance.",
-            )
-            return {"CANCELLED"}
-
-        message = f"Stored {len(mappings)} mapping(s) from {len(matched_pairs)} seam pair(s)."
-        if unmatched_source or unmatched_target:
-            message += f" Unmatched: {len(unmatched_source)} source, {len(unmatched_target)} target."
-        self.report({"INFO"}, message)
-        return {"FINISHED"}
-
-
-class MDT_OT_clear_group_mappings(bpy.types.Operator):
-    """Clear stored group mappings."""
-
-    bl_idname = "mdt.clear_group_mappings"
-    bl_label = "Clear Mapping"
-    bl_description = "Clear the currently stored seam mapping results"
-
-    def execute(self, context):
-        store_group_mappings(context.scene, [])
-        self.report({"INFO"}, "Stored mappings were cleared.")
-        return {"FINISHED"}
-
-
-class MDT_OT_apply_seam_mapping(bpy.types.Operator):
-    """Copy source seam weights to the target seam through stored group mappings."""
-
-    bl_idname = "mdt.apply_seam_mapping"
-    bl_label = "Apply To Target"
-    bl_description = "Pair nearby seam vertices and write mapped source weights onto the target seam"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, _context):
-        return True
-
-    def execute(self, context):
-        settings = context.scene.mdt_seam_settings
-        source_obj, target_obj = resolve_apply_objects(context, settings)
-
-        if not is_mesh_object(source_obj):
-            self.report({"ERROR"}, "Choose a valid apply source mesh.")
-            return {"CANCELLED"}
-
-        if not is_mesh_object(target_obj):
-            self.report({"ERROR"}, "Choose a valid apply target mesh.")
-            return {"CANCELLED"}
-
-        if source_obj == target_obj:
-            self.report({"ERROR"}, "Source and target objects must be different.")
-            return {"CANCELLED"}
-
-        resolved_mappings, skipped_missing_source_groups = resolve_enabled_mapping_direction(
-            context.scene,
-            source_obj,
-            settings.invert_mapping,
-        )
-        if not resolved_mappings:
-            self.report(
-                {"ERROR"},
-                "No enabled mappings fit the current apply direction.",
-            )
-            return {"CANCELLED"}
-
-        source_seam_vertices = collect_seam_vertices(source_obj)
-        target_seam_vertices = collect_seam_vertices(target_obj)
-
-        if not source_seam_vertices:
-            self.report({"ERROR"}, "The source object has no open-boundary seam vertices.")
-            return {"CANCELLED"}
-
-        if not target_seam_vertices:
-            self.report({"ERROR"}, "The target object has no open-boundary seam vertices.")
-            return {"CANCELLED"}
-
-        matched_pairs, unmatched_source, unmatched_target = build_vertex_pairs(
-            source_seam_vertices,
-            target_seam_vertices,
-            settings.match_tolerance,
-        )
-
-        if not matched_pairs:
-            self.report({"ERROR"}, "No nearby seam vertex pairs were found. Increase Match Tolerance.")
-            return {"CANCELLED"}
-
-        syncable_group_names = resolve_syncable_group_names(
-            source_obj,
-            target_obj,
-            settings.only_deform_groups,
-        )
-        if syncable_group_names is not None:
-            resolved_mappings = [
-                (source_group, target_group)
-                for source_group, target_group in resolved_mappings
-                if source_group in syncable_group_names and target_group in syncable_group_names
-            ]
-            if not resolved_mappings:
-                self.report(
-                    {"ERROR"},
-                    "No enabled mappings remain after filtering to deform groups.",
-                )
-                return {"CANCELLED"}
-
-        target_groups_to_clear = {target_group for _source_group, target_group in resolved_mappings}
 
         try:
             previous_mode = ensure_object_mode(context)
@@ -197,23 +37,63 @@ class MDT_OT_apply_seam_mapping(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            for source_index, target_index in matched_pairs:
-                apply_weights_to_vertex(
-                    source_obj,
-                    source_index,
-                    target_obj,
-                    target_index,
-                    resolved_mappings,
-                    target_groups_to_clear,
-                    syncable_group_names,
-                )
+            target_seam_vertices = collect_seam_vertices(target_obj)
+            if not target_seam_vertices:
+                self.report({"ERROR"}, f"{target_obj.name} has no open-boundary seam vertices.")
+                return {"CANCELLED"}
+
+            changed_object_count = 0
+            unchanged_object_count = 0
+            total_mapping_count = 0
+            total_renamed_count = 0
+            total_conflict_count = 0
+            total_missing_count = 0
+            skipped_errors = []
+
+            for source_obj in source_objects:
+                try:
+                    result = rename_seam_groups_to_target(
+                        source_obj,
+                        target_obj,
+                        target_seam_vertices=target_seam_vertices,
+                    )
+                except ValueError as exc:
+                    skipped_errors.append(f"{source_obj.name}: {exc}")
+                    continue
+
+                total_mapping_count += result["mapping_count"]
+                total_renamed_count += result["renamed_count"]
+                total_conflict_count += result["skipped_conflict_count"]
+                total_missing_count += result["skipped_missing_count"]
+                if result["renamed_count"] > 0:
+                    changed_object_count += 1
+                else:
+                    unchanged_object_count += 1
         finally:
             restore_context_mode(previous_mode)
 
-        message = f"Applied {len(resolved_mappings)} mapping(s) across {len(matched_pairs)} seam pair(s)."
-        if skipped_missing_source_groups:
-            message += f" Skipped {skipped_missing_source_groups} missing source mapping(s)."
-        if unmatched_source or unmatched_target:
-            message += f" Unmatched: {len(unmatched_source)} source, {len(unmatched_target)} target."
+        if total_renamed_count == 0:
+            message = "No selected seam vertex groups needed renaming."
+            if skipped_errors:
+                message += f" Skipped {len(skipped_errors)} object(s). First: {skipped_errors[0]}"
+            if total_conflict_count > 0:
+                message += f" Skipped {total_conflict_count} conflicting group(s)."
+            self.report({"WARNING"}, message)
+            return {"CANCELLED"}
+
+        message = (
+            f"Renamed {total_renamed_count} seam vertex group(s) on "
+            f"{changed_object_count} object(s) using {target_obj.name}."
+        )
+        if unchanged_object_count > 0:
+            message += f" {unchanged_object_count} object(s) already matched."
+        if total_conflict_count > 0:
+            message += f" Skipped {total_conflict_count} conflicting group(s)."
+        if total_missing_count > 0:
+            message += f" Skipped {total_missing_count} missing group(s)."
+        if skipped_errors:
+            message += f" Skipped {len(skipped_errors)} object(s). First: {skipped_errors[0]}"
+        if total_mapping_count > total_renamed_count:
+            message += f" Checked {total_mapping_count} seam mapping(s)."
         self.report({"INFO"}, message)
         return {"FINISHED"}

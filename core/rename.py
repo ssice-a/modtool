@@ -146,6 +146,63 @@ def apply_rename_plan(resolved_pairs):
     return len(changed_pairs)
 
 
+def apply_exact_name_pairs(obj, name_pairs):
+    """Rename vertex groups to exact target names while skipping unsafe conflicts."""
+    name_pairs = list(name_pairs)
+    if obj is None:
+        return {
+            "renamed_count": 0,
+            "skipped_conflict_count": 0,
+            "skipped_missing_count": len(name_pairs),
+        }
+
+    source_groups_by_name = {group.name: group for group in obj.vertex_groups}
+    raw_pairs = []
+    skipped_missing_count = 0
+
+    for source_name, target_name in name_pairs:
+        if not source_name or not target_name:
+            skipped_missing_count += 1
+            continue
+
+        source_group = source_groups_by_name.get(source_name)
+        if source_group is None:
+            skipped_missing_count += 1
+            continue
+        if source_group.name == target_name:
+            continue
+        raw_pairs.append((source_group, target_name))
+
+    if not raw_pairs:
+        return {
+            "renamed_count": 0,
+            "skipped_conflict_count": 0,
+            "skipped_missing_count": skipped_missing_count,
+        }
+
+    rename_source_names = {group.name for group, _target_name in raw_pairs}
+    existing_names = {group.name for group in obj.vertex_groups}
+    used_target_names = set()
+    resolved_pairs = []
+    skipped_conflict_count = 0
+
+    for group, target_name in raw_pairs:
+        if target_name in used_target_names:
+            skipped_conflict_count += 1
+            continue
+        if target_name in existing_names and target_name not in rename_source_names:
+            skipped_conflict_count += 1
+            continue
+        used_target_names.add(target_name)
+        resolved_pairs.append((group, target_name))
+
+    return {
+        "renamed_count": apply_rename_plan(resolved_pairs),
+        "skipped_conflict_count": skipped_conflict_count,
+        "skipped_missing_count": skipped_missing_count,
+    }
+
+
 def count_empty_vertex_groups(obj):
     """Count vertex groups that have no effective non-zero weights on any vertex."""
     if obj is None:

@@ -6,7 +6,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Mod Tool",
-    "description": "Mesh modding helpers for shape keys, vertex groups, seam transfer, and material splits.",
+    "description": "Mesh modding helpers for shape keys, vertex groups, seam renaming, and material splits.",
     "category": "Mesh",
 }
 

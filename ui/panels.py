@@ -2,11 +2,11 @@
 
 import bpy
 
+from ..core.armature_cleanup import count_pose_constraints, count_pose_locks, get_cleanup_mesh_objects, resolve_cleanup_armature
 from ..core.common import get_selected_mesh_objects, is_mesh_object
 from ..core.group_mapping import count_applicable_group_matches, count_group_match_status, resolve_group_mapping_objects
 from ..core.modifier_apply import get_enabled_modifier_names, has_shape_keys as has_modifier_shape_keys
 from ..core.rename import count_empty_vertex_groups, get_rename_preview
-from ..core.seam import count_enabled_group_mappings, resolve_apply_objects, resolve_mapping_objects
 from ..core.shape_keys import has_transferable_shape_keys, resolve_transfer_objects
 
 
@@ -90,6 +90,10 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
             )
         else:
             layout.label(text="Rule rename uses the active mesh object's vertex groups.", icon="INFO")
+
+        seam_row = layout.row()
+        seam_row.enabled = is_mesh_object(obj) and len(get_selected_mesh_objects(context)) > 1
+        seam_row.operator("mdt.rename_selected_seam_groups", icon="MOD_VERTEX_WEIGHT")
 
         mapping_settings = scene.mdt_group_match_settings
         source_obj, target_obj = resolve_group_mapping_objects(mapping_settings)
@@ -215,76 +219,17 @@ class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
         )
         action_row.operator("mdt.transfer_shape_keys", icon="MOD_MESHDEFORM")
 
+        delete_row = layout.row()
+        delete_row.enabled = has_modifier_shape_keys(context.object)
+        delete_row.operator(
+            "mdt.delete_selected_geometry_keep_shape_keys",
+            text="Delete Selection Keep Shape Keys",
+            icon="TRASH",
+        )
+
         action_row = layout.row()
         action_row.enabled = len(modifier_apply_objects) > 0
-        action_row.operator("mdt.apply_modifier_keep_shape_keys", text="Apply Selected Modifiers", icon="CHECKMARK")
-
-
-class MDT_PT_seam_transfer(_MDT_PT_base, bpy.types.Panel):
-    """Sidebar panel for seam mapping and seam-weight transfer."""
-
-    bl_label = "Seam Transfer"
-    bl_options = {"DEFAULT_CLOSED"}
-
-    @classmethod
-    def poll(cls, _context):
-        return True
-
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-        settings = scene.mdt_seam_settings
-        analyze_source, analyze_target = resolve_mapping_objects(context, settings)
-        apply_source, apply_target = resolve_apply_objects(context, settings)
-
-        analyze_box = layout.box()
-        analyze_col = analyze_box.column(align=True)
-        analyze_col.prop(settings, "source_object")
-        analyze_col.prop(settings, "target_object")
-        tolerance_row = analyze_col.row(align=True)
-        tolerance_row.prop(settings, "match_tolerance")
-        tolerance_row.prop(settings, "weight_tolerance")
-        analyze_col.prop(settings, "only_deform_groups")
-        analyze_row = analyze_box.row(align=True)
-        analyze_row.enabled = (
-            analyze_source is not None
-            and analyze_target is not None
-            and analyze_source != analyze_target
-        )
-        analyze_row.operator("mdt.analyze_seam_mapping", icon="VIEWZOOM")
-        analyze_row.operator("mdt.clear_group_mappings", icon="TRASH")
-
-        mapping_box = layout.box()
-        mapping_box.label(
-            text=f"Mappings {count_enabled_group_mappings(scene)}/{len(scene.mdt_group_mappings)}",
-            icon="LINKED",
-        )
-        if len(scene.mdt_group_mappings) == 0:
-            mapping_box.label(text="No mappings stored.", icon="INFO")
-        else:
-            mapping_box.template_list(
-                "MDT_UL_group_mappings",
-                "",
-                scene,
-                "mdt_group_mappings",
-                scene,
-                "mdt_active_group_mapping_index",
-                rows=min(7, max(4, len(scene.mdt_group_mappings))),
-            )
-
-        apply_box = layout.box()
-        apply_col = apply_box.column(align=True)
-        apply_col.prop(settings, "apply_source_object")
-        apply_col.prop(settings, "apply_target_object")
-        apply_col.prop(settings, "invert_mapping")
-        apply_row = apply_box.row(align=True)
-        apply_row.enabled = (
-            apply_source is not None
-            and apply_target is not None
-            and apply_source != apply_target
-            and count_enabled_group_mappings(scene) > 0
-        )
-        apply_row.operator("mdt.apply_seam_mapping", icon="MOD_VERTEX_WEIGHT")
+        action_row.operator("mdt.apply_modifier_keep_shape_keys", text="Apply Enabled Modifiers", icon="CHECKMARK")
 
 
 class MDT_PT_materials(_MDT_PT_base, bpy.types.Panel):
@@ -311,3 +256,43 @@ class MDT_PT_materials(_MDT_PT_base, bpy.types.Panel):
 
         if not has_mesh_selection:
             layout.label(text="Select one or more mesh objects.", icon="INFO")
+
+
+class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):
+    """Sidebar panel for armature FK cleanup."""
+
+    bl_label = "Armature"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, _context):
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        armature_obj, error = resolve_cleanup_armature(context)
+
+        box = layout.box()
+        box.label(text="FK Cleanup", icon="ARMATURE_DATA")
+
+        if armature_obj is None:
+            box.label(text=error, icon="INFO")
+            action_row = box.row()
+            action_row.enabled = False
+            action_row.operator("mdt.clean_fk_armature", icon="ARMATURE_DATA")
+            return
+
+        mesh_objects = get_cleanup_mesh_objects(context, armature_obj)
+        box.label(text=f"Target: {armature_obj.name}", icon="ARMATURE_DATA")
+        if mesh_objects:
+            box.label(text=f"Weight Meshes: {len(mesh_objects)}", icon="MESH_DATA")
+        else:
+            box.label(text="No linked or selected mesh found.", icon="ERROR")
+        box.label(text=f"Pose Constraints: {count_pose_constraints(armature_obj)}", icon="CONSTRAINT_BONE")
+        box.label(text=f"Pose Locks: {count_pose_locks(armature_obj)}", icon="UNLOCKED")
+        box.label(text="Keeps weighted bones; clears constraints and transform locks.", icon="INFO")
+        box.label(text="Removes control bones and keeps retained hierarchy.", icon="INFO")
+
+        action_row = box.row()
+        action_row.enabled = len(mesh_objects) > 0
+        action_row.operator("mdt.clean_fk_armature", icon="ARMATURE_DATA")
