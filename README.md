@@ -5,6 +5,7 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 ## Features
 
 - Vertex-group renaming with rule-based and sequential modes
+- Spatial vertex-group name mapping from a source mesh to a target mesh
 - Shape-key transfer between overlapping meshes with different vertex counts
 - Shape-key-safe deletion for selected mesh geometry
 - Shape-key-safe modifier apply for enabled modifiers, including data-transfer and vertex-group edits
@@ -37,6 +38,6 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 - `ops/`
   Blender operators, split by feature area.
 - `ui/`
-  Sidebar panels and UI lists.
+  Sidebar panels.
 - `properties.py`
   Scene properties and property groups.

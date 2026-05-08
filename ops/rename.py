@@ -7,8 +7,11 @@ from ..core.rename import (
     apply_rename_plan,
     build_rename_plan,
     count_empty_vertex_groups,
+    count_non_deforming_vertex_groups,
+    has_deforming_armature_groups,
     has_rename_rule,
     remove_empty_vertex_groups,
+    remove_non_deforming_vertex_groups,
     reset_rename_settings,
     resolve_final_names,
 )
@@ -90,4 +93,44 @@ class MDT_OT_remove_empty_vertex_groups(bpy.types.Operator):
 
         removed_count = remove_empty_vertex_groups(obj)
         self.report({"INFO"}, f"Removed {removed_count} empty vertex group(s).")
+        return {"FINISHED"}
+
+
+class MDT_OT_keep_deforming_vertex_groups(bpy.types.Operator):
+    """Keep only weighted vertex groups that are controlled by deform bones."""
+
+    bl_idname = "mdt.keep_deforming_vertex_groups"
+    bl_label = "Keep Bone Groups"
+    bl_description = "Delete helper and empty groups, keeping only weighted groups that match deform bones on Armature modifiers"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return is_mesh_object(obj) and len(getattr(obj, "vertex_groups", [])) > 0
+
+    def execute(self, context):
+        obj = context.object
+        if not has_deforming_armature_groups(obj):
+            self.report({"ERROR"}, "The active mesh needs an Armature modifier with deform bones.")
+            return {"CANCELLED"}
+
+        removable_count = count_non_deforming_vertex_groups(obj)
+        if removable_count == 0:
+            self.report({"INFO"}, "No helper or empty deform vertex groups were found.")
+            return {"CANCELLED"}
+
+        try:
+            result = remove_non_deforming_vertex_groups(obj)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        message = (
+            f"Kept {result['kept_count']} weighted deform group(s), "
+            f"removed {result['removed_count']} other group(s)."
+        )
+        if result["removed_empty_deform_count"] > 0:
+            message += f" Empty deform groups: {result['removed_empty_deform_count']}."
+        self.report({"INFO"}, message)
         return {"FINISHED"}

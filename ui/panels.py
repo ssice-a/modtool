@@ -2,12 +2,9 @@
 
 import bpy
 
-from ..core.armature_cleanup import count_pose_constraints, count_pose_locks, get_cleanup_mesh_objects, resolve_cleanup_armature
-from ..core.common import get_selected_mesh_objects, is_mesh_object
-from ..core.group_mapping import count_applicable_group_matches, count_group_match_status, resolve_group_mapping_objects
-from ..core.modifier_apply import get_enabled_modifier_names, has_shape_keys as has_modifier_shape_keys
-from ..core.rename import count_empty_vertex_groups, get_rename_preview
-from ..core.shape_keys import has_transferable_shape_keys, resolve_transfer_objects
+from ..core.common import is_mesh_object
+from ..core.group_mapping import resolve_group_mapping_objects
+from ..core.shape_keys import resolve_transfer_objects
 
 
 class _MDT_PT_base:
@@ -51,33 +48,6 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
                 sequence_row.prop(settings, "sequence_start")
                 sequence_row.prop(settings, "sequence_padding")
 
-            preview_data = get_rename_preview(obj, settings)
-            preview_box = layout.box()
-            preview_box.label(
-                text=f"Preview {preview_data['changed_count']}/{preview_data['total_count']}",
-                icon="HIDE_OFF",
-            )
-
-            if preview_data["error"]:
-                preview_box.label(text=preview_data["error"], icon="ERROR")
-            elif preview_data["changed_count"] == 0:
-                preview_box.label(text="No changes yet.", icon="INFO")
-            else:
-                for old_name, new_name, _changed in preview_data["rows"]:
-                    row = preview_box.row(align=True)
-                    row.label(text=old_name, icon="GROUP_VERTEX")
-                    row.label(text="->")
-                    row.label(text=new_name)
-
-                if preview_data["changed_count"] > len(preview_data["rows"]):
-                    preview_box.label(
-                        text=f"Showing {len(preview_data['rows'])} of {preview_data['changed_count']}",
-                        icon="INFO",
-                    )
-
-                if preview_data["adjusted_count"] > 0:
-                    preview_box.label(text=f"Auto suffixes: {preview_data['adjusted_count']}", icon="SORTALPHA")
-
             button_row = layout.row(align=True)
             button_row.operator("mdt.batch_rename_groups", icon="CHECKMARK")
             button_row.operator("mdt.reset_rename_settings", icon="LOOP_BACK")
@@ -85,14 +55,19 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
             cleanup_row = layout.row()
             cleanup_row.operator(
                 "mdt.remove_empty_vertex_groups",
-                text=f"Remove Empty ({count_empty_vertex_groups(obj)})",
+                text="Remove Empty",
                 icon="TRASH",
+            )
+            keep_row = layout.row()
+            keep_row.operator(
+                "mdt.keep_deforming_vertex_groups",
+                text="Keep Bone Groups",
+                icon="ARMATURE_DATA",
             )
         else:
             layout.label(text="Rule rename uses the active mesh object's vertex groups.", icon="INFO")
 
         seam_row = layout.row()
-        seam_row.enabled = is_mesh_object(obj) and len(get_selected_mesh_objects(context)) > 1
         seam_row.operator("mdt.rename_selected_seam_groups", icon="MOD_VERTEX_WEIGHT")
 
         mapping_settings = scene.mdt_group_match_settings
@@ -103,72 +78,16 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
         mapping_col = mapping_box.column(align=True)
         mapping_col.prop(mapping_settings, "source_object")
         mapping_col.prop(mapping_settings, "target_object")
-        mapping_col.prop(mapping_settings, "candidate_limit")
-        mapping_col.prop(mapping_settings, "surface_tolerance")
-        mapping_col.prop(mapping_settings, "prefer_deform_groups")
 
-        analyze_row = mapping_box.row()
-        analyze_row.enabled = (
+        rename_row = mapping_box.row()
+        rename_row.enabled = (
             source_obj is not None
             and target_obj is not None
             and source_obj != target_obj
         )
-        analyze_row.operator("mdt.analyze_group_mapping", icon="VIEWZOOM")
+        rename_row.operator("mdt.rename_groups_from_target", icon="CHECKMARK")
 
-        if len(scene.mdt_group_match_results) > 0:
-            stats_row = mapping_box.row(align=True)
-            stats_row.label(text=f"Direct {count_group_match_status(scene, 'DIRECT')}", icon="CHECKMARK")
-            stats_row.label(text=f"Manual {count_group_match_status(scene, 'MANUAL')}", icon="GREASEPENCIL")
-            stats_row.label(text=f"Ambiguous {count_group_match_status(scene, 'AMBIGUOUS')}", icon="QUESTION")
-            stats_row.label(text=f"Unmatched {count_group_match_status(scene, 'UNMATCHED')}", icon="ERROR")
-            stats_row.label(text=f"Conflict {count_group_match_status(scene, 'CONFLICT')}", icon="CANCEL")
-
-            list_row = mapping_box.row()
-            list_row.template_list(
-                "MDT_UL_group_match_results",
-                "",
-                scene,
-                "mdt_group_match_results",
-                scene,
-                "mdt_active_group_match_result_index",
-                rows=min(8, max(4, len(scene.mdt_group_match_results))),
-            )
-            button_col = list_row.column(align=True)
-            button_col.operator("mdt.add_group_match_row", text="", icon="ADD")
-            button_col.operator("mdt.remove_group_match_row", text="", icon="REMOVE")
-
-            if 0 <= scene.mdt_active_group_match_result_index < len(scene.mdt_group_match_results):
-                active_item = scene.mdt_group_match_results[scene.mdt_active_group_match_result_index]
-                detail_box = mapping_box.box()
-                if source_obj is not None:
-                    detail_box.prop_search(active_item, "source_group", source_obj, "vertex_groups", text="Source")
-                else:
-                    detail_box.prop(active_item, "source_group")
-                if target_obj is not None:
-                    detail_box.prop_search(active_item, "target_group", target_obj, "vertex_groups", text="Target")
-                else:
-                    detail_box.prop(active_item, "target_group")
-                detail_box.label(text=f"Status: {active_item.status.title()} | Confidence: {active_item.confidence:.2f}")
-                detail_box.label(
-                    text=f"Overlap: {active_item.score_overlap:.2f} | Centroid: {active_item.score_centroid:.2f}"
-                )
-                detail_box.label(text=active_item.reason or "No extra details.", icon="INFO")
-        else:
-            mapping_box.label(text="No mapping analysis yet.", icon="INFO")
-            button_row = mapping_box.row(align=True)
-            button_row.operator("mdt.add_group_match_row", text="Add Manual Row", icon="ADD")
-
-        action_row = mapping_box.row(align=True)
-        action_row.enabled = len(scene.mdt_group_match_results) > 0
-        action_row.operator("mdt.accept_group_match_candidates", icon="CHECKBOX_HLT")
-
-        apply_row = mapping_box.row()
-        apply_row.enabled = (
-            source_obj is not None
-            and len(scene.mdt_group_match_results) > 0
-            and count_applicable_group_matches(scene) > 0
-        )
-        apply_row.operator("mdt.apply_group_mapping_rename", icon="CHECKMARK")
+        mapping_box.label(text="Select Source and Target, then rename.", icon="INFO")
 
 
 class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
@@ -184,12 +103,6 @@ class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
         layout = self.layout
         settings = context.scene.mdt_shape_key_settings
         source_obj, target_obj = resolve_transfer_objects(context, settings)
-        selected_mesh_objects = get_selected_mesh_objects(context)
-        modifier_apply_objects = [
-            obj
-            for obj in selected_mesh_objects
-            if has_modifier_shape_keys(obj) and len(get_enabled_modifier_names(obj)) > 0
-        ]
 
         box = layout.box()
         col = box.column(align=True)
@@ -204,23 +117,15 @@ class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
             col.prop(settings, "max_distance")
         col.prop(settings, "replace_existing")
 
-        if source_obj is not None and has_transferable_shape_keys(source_obj):
-            key_count = len(source_obj.data.shape_keys.key_blocks) - 1
-            box.label(text=f"Source Keys: {key_count}", icon="SHAPEKEY_DATA")
-        elif source_obj is not None:
-            box.label(text="Source has no transferable keys.", icon="INFO")
-
         action_row = layout.row()
         action_row.enabled = (
             source_obj is not None
             and target_obj is not None
             and source_obj != target_obj
-            and has_transferable_shape_keys(source_obj)
         )
         action_row.operator("mdt.transfer_shape_keys", icon="MOD_MESHDEFORM")
 
         delete_row = layout.row()
-        delete_row.enabled = has_modifier_shape_keys(context.object)
         delete_row.operator(
             "mdt.delete_selected_geometry_keep_shape_keys",
             text="Delete Selection Keep Shape Keys",
@@ -228,7 +133,6 @@ class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
         )
 
         action_row = layout.row()
-        action_row.enabled = len(modifier_apply_objects) > 0
         action_row.operator("mdt.apply_modifier_keep_shape_keys", text="Apply Enabled Modifiers", icon="CHECKMARK")
 
 
@@ -244,18 +148,12 @@ class MDT_PT_materials(_MDT_PT_base, bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        has_mesh_selection = len(get_selected_mesh_objects(context)) > 0
 
         create_row = layout.row()
-        create_row.enabled = has_mesh_selection
         create_row.operator("mdt.create_named_materials", icon="MATERIAL")
 
         split_row = layout.row()
-        split_row.enabled = has_mesh_selection
         split_row.operator("mdt.separate_by_material", icon="MOD_EXPLODE")
-
-        if not has_mesh_selection:
-            layout.label(text="Select one or more mesh objects.", icon="INFO")
 
 
 class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):
@@ -270,29 +168,11 @@ class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        armature_obj, error = resolve_cleanup_armature(context)
 
         box = layout.box()
         box.label(text="FK Cleanup", icon="ARMATURE_DATA")
-
-        if armature_obj is None:
-            box.label(text=error, icon="INFO")
-            action_row = box.row()
-            action_row.enabled = False
-            action_row.operator("mdt.clean_fk_armature", icon="ARMATURE_DATA")
-            return
-
-        mesh_objects = get_cleanup_mesh_objects(context, armature_obj)
-        box.label(text=f"Target: {armature_obj.name}", icon="ARMATURE_DATA")
-        if mesh_objects:
-            box.label(text=f"Weight Meshes: {len(mesh_objects)}", icon="MESH_DATA")
-        else:
-            box.label(text="No linked or selected mesh found.", icon="ERROR")
-        box.label(text=f"Pose Constraints: {count_pose_constraints(armature_obj)}", icon="CONSTRAINT_BONE")
-        box.label(text=f"Pose Locks: {count_pose_locks(armature_obj)}", icon="UNLOCKED")
-        box.label(text="Keeps weighted bones; clears constraints and transform locks.", icon="INFO")
-        box.label(text="Removes control bones and keeps retained hierarchy.", icon="INFO")
+        box.label(text="Bakes visible mesh modifiers before cleaning.", icon="INFO")
+        box.label(text="Applies current pose as rest, then rebinds Armature modifiers.", icon="INFO")
 
         action_row = box.row()
-        action_row.enabled = len(mesh_objects) > 0
         action_row.operator("mdt.clean_fk_armature", icon="ARMATURE_DATA")

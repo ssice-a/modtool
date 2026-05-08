@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import bpy
 
-from .common import get_selected_mesh_objects, is_mesh_object
+from .common import get_selected_mesh_objects, is_mesh_object, run_object_operator
+from .modifier_apply import apply_modifier_with_shape_keys, get_enabled_modifier_names, has_shape_keys
 
 
 _WEIGHT_EPSILON = 1.0e-8
@@ -188,6 +189,29 @@ def clear_pose_locks(armature_obj, bone_names=None):
     return cleared_count
 
 
+def clear_pose_transforms(armature_obj, bone_names=None):
+    """Clear pose transforms after the current pose has been applied as rest pose."""
+    if not is_armature_object(armature_obj) or armature_obj.pose is None:
+        return 0
+
+    target_bone_names = set(bone_names) if bone_names is not None else None
+    cleared_count = 0
+    for pose_bone in armature_obj.pose.bones:
+        if not _is_target_pose_bone(pose_bone, target_bone_names):
+            continue
+
+        pose_bone.location = (0.0, 0.0, 0.0)
+        pose_bone.scale = (1.0, 1.0, 1.0)
+        if pose_bone.rotation_mode == "QUATERNION":
+            pose_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        elif pose_bone.rotation_mode == "AXIS_ANGLE":
+            pose_bone.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+        else:
+            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+        cleared_count += 1
+    return cleared_count
+
+
 def _build_nearest_kept_parent_map(parent_map, keep_bone_names):
     assignments = {}
     for bone_name in keep_bone_names:
@@ -198,31 +222,135 @@ def _build_nearest_kept_parent_map(parent_map, keep_bone_names):
     return assignments
 
 
-def clean_fk_armature(context, armature_obj, mesh_objects, weight_epsilon=_WEIGHT_EPSILON):
-    """Keep weighted bones, preserve retained hierarchy, and strip pose constraints."""
-    if not is_armature_object(armature_obj):
-        raise ValueError("Choose a valid armature.")
-    if not mesh_objects:
-        raise ValueError("Select at least one mesh, or use an armature that has linked mesh objects.")
-
-    weighted_group_names = get_weighted_vertex_group_names(mesh_objects, weight_epsilon)
-    original_bone_names = {bone.name for bone in armature_obj.data.bones}
-    keep_bone_names = weighted_group_names.intersection(original_bone_names)
-    if not keep_bone_names:
-        raise ValueError("No weighted vertex groups match bones on the armature.")
-
-    parent_map = {
-        bone.name: bone.parent.name if bone.parent is not None else None
-        for bone in armature_obj.data.bones
+def _capture_armature_modifier_settings(modifier):
+    settings = {
+        "name": modifier.name,
+        "show_viewport": modifier.show_viewport,
+        "show_render": modifier.show_render,
+        "show_in_editmode": getattr(modifier, "show_in_editmode", False),
+        "show_on_cage": getattr(modifier, "show_on_cage", False),
+        "show_expanded": getattr(modifier, "show_expanded", True),
     }
-    parent_assignments = _build_nearest_kept_parent_map(parent_map, keep_bone_names)
-    original_bone_count = len(original_bone_names)
+    for attribute_name in (
+        "use_vertex_groups",
+        "use_bone_envelopes",
+        "use_deform_preserve_volume",
+        "use_multi_modifier",
+        "vertex_group",
+        "invert_vertex_group",
+    ):
+        if hasattr(modifier, attribute_name):
+            settings[attribute_name] = getattr(modifier, attribute_name)
+    return settings
 
-    constraint_count = remove_pose_constraints(armature_obj)
-    lock_count = clear_pose_locks(armature_obj, keep_bone_names)
+
+def _capture_armature_modifier_bindings(mesh_objects, armature_obj):
+    bindings = {}
+    for obj in mesh_objects:
+        object_bindings = []
+        for modifier in obj.modifiers:
+            if modifier.type != "ARMATURE" or modifier.object != armature_obj:
+                continue
+            if not modifier.show_viewport:
+                continue
+            object_bindings.append(_capture_armature_modifier_settings(modifier))
+        if object_bindings:
+            bindings[obj.name] = object_bindings
+    return bindings
+
+
+def _apply_modifier_settings(modifier, settings):
+    for attribute_name, value in settings.items():
+        if attribute_name == "name" or not hasattr(modifier, attribute_name):
+            continue
+        try:
+            setattr(modifier, attribute_name, value)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _restore_armature_modifier_bindings(mesh_objects, armature_obj, bindings):
+    restored_count = 0
+    for obj in mesh_objects:
+        for settings in bindings.get(obj.name, []):
+            modifier = obj.modifiers.new(settings["name"], "ARMATURE")
+            modifier.object = armature_obj
+            _apply_modifier_settings(modifier, settings)
+            modifier.show_viewport = True
+            restored_count += 1
+    return restored_count
+
+
+def _remove_armature_modifiers(mesh_objects, armature_obj):
+    removed_count = 0
+    for obj in mesh_objects:
+        for modifier in reversed(list(obj.modifiers)):
+            if modifier.type != "ARMATURE" or modifier.object != armature_obj:
+                continue
+            obj.modifiers.remove(modifier)
+            removed_count += 1
+    return removed_count
+
+
+def _apply_enabled_modifiers_without_shape_keys(context, obj):
+    applied_names = []
+    for modifier_name in get_enabled_modifier_names(obj):
+        modifier = obj.modifiers.get(modifier_name)
+        if modifier is None or not modifier.show_viewport:
+            continue
+
+        try:
+            result = run_object_operator(context, obj, "modifier_apply", modifier=modifier.name)
+        except RuntimeError as exc:
+            raise ValueError(f"Could not apply modifier '{modifier_name}' on {obj.name}: {exc}") from exc
+        if "FINISHED" not in result:
+            raise ValueError(f"Could not apply modifier '{modifier_name}' on {obj.name}.")
+        applied_names.append(modifier_name)
+    return {
+        "applied_modifier_names": applied_names,
+        "shape_key_count": 0,
+        "vertex_count": len(obj.data.vertices),
+        "vertex_group_count": len(obj.vertex_groups),
+    }
+
+
+def _apply_mesh_modifiers_preserving_shape_keys(context, mesh_objects):
+    results = []
+    for obj in mesh_objects:
+        if len(get_enabled_modifier_names(obj)) == 0:
+            results.append((obj.name, {"applied_modifier_names": [], "shape_key_count": 0}))
+            continue
+
+        if has_shape_keys(obj):
+            results.append((obj.name, apply_modifier_with_shape_keys(context, obj)))
+        else:
+            results.append((obj.name, _apply_enabled_modifiers_without_shape_keys(context, obj)))
+    return results
+
+
+def _apply_current_pose_as_rest(context, armature_obj):
+    if not is_armature_object(armature_obj) or armature_obj.pose is None:
+        return False
 
     context.view_layer.objects.active = armature_obj
     armature_obj.select_set(True)
+    bpy.ops.object.mode_set(mode="POSE")
+    try:
+        try:
+            result = bpy.ops.pose.armature_apply(selected=False)
+        except TypeError:
+            result = bpy.ops.pose.armature_apply()
+        if "FINISHED" not in result:
+            raise ValueError("Could not apply the current armature pose as the new rest pose.")
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    context.view_layer.update()
+    return True
+
+
+def _remove_unweighted_bones(armature_obj, keep_bone_names, parent_assignments):
+    original_bone_names = {bone.name for bone in armature_obj.data.bones}
     bpy.ops.object.mode_set(mode="EDIT")
     try:
         edit_bones = armature_obj.data.edit_bones
@@ -246,11 +374,60 @@ def clean_fk_armature(context, armature_obj, mesh_objects, weight_epsilon=_WEIGH
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
 
+    return removed_bone_count
+
+
+def clean_fk_armature(context, armature_obj, mesh_objects, weight_epsilon=_WEIGHT_EPSILON):
+    """Bake visible mesh modifiers, turn the current armature pose into rest pose, and rebuild FK bindings."""
+    if not is_armature_object(armature_obj):
+        raise ValueError("Choose a valid armature.")
+    if not mesh_objects:
+        raise ValueError("Select at least one mesh, or use an armature that has linked mesh objects.")
+
+    mesh_objects = [obj for obj in mesh_objects if is_mesh_object(obj)]
+    if not mesh_objects:
+        raise ValueError("Select at least one mesh object.")
+
+    original_bone_names = {bone.name for bone in armature_obj.data.bones}
+    original_bone_count = len(original_bone_names)
+    armature_bindings = _capture_armature_modifier_bindings(mesh_objects, armature_obj)
+    if not armature_bindings:
+        raise ValueError("No viewport-enabled Armature modifier using this armature was found.")
+
+    modifier_results = _apply_mesh_modifiers_preserving_shape_keys(context, mesh_objects)
+    removed_leftover_armature_modifier_count = _remove_armature_modifiers(mesh_objects, armature_obj)
+
+    weighted_group_names = get_weighted_vertex_group_names(mesh_objects, weight_epsilon)
+    keep_bone_names = weighted_group_names.intersection(original_bone_names)
+    if not keep_bone_names:
+        raise ValueError("No weighted vertex groups match bones on the armature after applying modifiers.")
+
+    parent_map = {
+        bone.name: bone.parent.name if bone.parent is not None else None
+        for bone in armature_obj.data.bones
+    }
+    parent_assignments = _build_nearest_kept_parent_map(parent_map, keep_bone_names)
+
+    _apply_current_pose_as_rest(context, armature_obj)
+    constraint_count = remove_pose_constraints(armature_obj)
+    context.view_layer.objects.active = armature_obj
+    armature_obj.select_set(True)
+    transform_count = clear_pose_transforms(armature_obj)
+    lock_count = clear_pose_locks(armature_obj)
+    removed_bone_count = _remove_unweighted_bones(armature_obj, keep_bone_names, parent_assignments)
+    restored_modifier_count = _restore_armature_modifier_bindings(mesh_objects, armature_obj, armature_bindings)
+    context.view_layer.update()
+
     return {
+        "applied_modifier_count": sum(len(result["applied_modifier_names"]) for _obj_name, result in modifier_results),
+        "shape_key_count": sum(result.get("shape_key_count", 0) for _obj_name, result in modifier_results),
         "constraint_count": constraint_count,
+        "transform_count": transform_count,
         "lock_count": lock_count,
         "kept_bone_count": len(keep_bone_names),
         "removed_bone_count": removed_bone_count,
+        "restored_modifier_count": restored_modifier_count,
+        "removed_leftover_armature_modifier_count": removed_leftover_armature_modifier_count,
         "original_bone_count": original_bone_count,
         "mesh_count": len(mesh_objects),
         "weighted_group_count": len(weighted_group_names),

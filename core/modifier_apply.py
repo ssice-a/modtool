@@ -202,16 +202,23 @@ def _set_capture_modifier_prefix(obj, target_index):
             modifier.show_viewport = False
 
 
-def _set_preview_shape(obj, key_index):
+def _prepare_shape_key_preview_capture(obj):
     shape_keys = getattr(obj.data, "shape_keys", None)
     if shape_keys is None or len(shape_keys.key_blocks) == 0:
-        return
+        return None
 
     for key_block in shape_keys.key_blocks:
         key_block.value = 0.0
         key_block.mute = False
 
     obj.show_only_shape_key = True
+    return shape_keys
+
+
+def _set_preview_shape(obj, shape_keys, key_index):
+    if shape_keys is None or len(shape_keys.key_blocks) == 0:
+        return
+
     obj.active_shape_key_index = min(max(0, key_index), len(shape_keys.key_blocks) - 1)
     if not shape_keys.use_relative and hasattr(shape_keys, "eval_time"):
         key_block = shape_keys.key_blocks[obj.active_shape_key_index]
@@ -432,7 +439,8 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         applied_mesh = _create_evaluated_mesh_snapshot(obj, depsgraph)
         expected_vertex_count = len(applied_mesh.vertices)
 
-        _set_preview_shape(obj, 0)
+        preview_shape_keys = _prepare_shape_key_preview_capture(obj)
+        _set_preview_shape(obj, preview_shape_keys, 0)
         context.view_layer.update()
         basis_coordinates, _basis_vertex_count = _capture_flat_vertex_coordinates(
             obj,
@@ -442,7 +450,7 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         _apply_flat_coordinates_to_mesh(applied_mesh, basis_coordinates)
 
         for key_info in shape_key_info["key_blocks"][1:]:
-            _set_preview_shape(obj, key_info["index"])
+            _set_preview_shape(obj, preview_shape_keys, key_info["index"])
             context.view_layer.update()
             flat_coordinates, _vertex_count = _capture_flat_vertex_coordinates(
                 obj,

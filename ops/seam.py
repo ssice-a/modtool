@@ -17,7 +17,7 @@ class MDT_OT_rename_selected_seam_groups(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         active_obj = context.object
-        return is_mesh_object(active_obj) and len(get_selected_mesh_objects(context)) > 1
+        return is_mesh_object(active_obj)
 
     def execute(self, context):
         target_obj = context.object

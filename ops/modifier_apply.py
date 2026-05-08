@@ -119,11 +119,14 @@ class MDT_OT_delete_selected_geometry_keep_shape_keys(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
-    def poll(cls, context):
-        return has_shape_keys(context.object)
+    def poll(cls, _context):
+        return True
 
     def execute(self, context):
         obj = context.object
+        if not has_shape_keys(obj):
+            self.report({"ERROR"}, "Choose a mesh object with shape keys.")
+            return {"CANCELLED"}
 
         try:
             previous_mode = ensure_object_mode(context)

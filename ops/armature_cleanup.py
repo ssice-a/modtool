@@ -16,8 +16,8 @@ class MDT_OT_clean_fk_armature(bpy.types.Operator):
     bl_idname = "mdt.clean_fk_armature"
     bl_label = "Clean To FK"
     bl_description = (
-        "Keep bones that match weighted vertex groups, remove unweighted/control bones, "
-        "strip pose constraints and transform locks, and preserve the retained parent hierarchy"
+        "Bake visible mesh modifiers, apply the current armature pose as rest pose, "
+        "remove unweighted/control bones, and rebind Armature modifiers"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -49,10 +49,13 @@ class MDT_OT_clean_fk_armature(bpy.types.Operator):
         self.report(
             {"INFO"},
             (
-                f"Cleaned {armature_obj.name}: kept {result['kept_bone_count']} / "
-                f"{result['original_bone_count']} bone(s), removed {result['removed_bone_count']} "
-                f"bone(s), stripped {result['constraint_count']} pose constraint(s), "
-                f"cleared {result['lock_count']} lock(s)."
+                f"Cleaned {armature_obj.name}: applied {result['applied_modifier_count']} modifier(s) "
+                f"on {result['mesh_count']} mesh object(s), preserved {result['shape_key_count']} "
+                f"shape key(s), kept {result['kept_bone_count']} / {result['original_bone_count']} "
+                f"bone(s), removed {result['removed_bone_count']} bone(s), stripped "
+                f"{result['constraint_count']} constraint(s), cleared {result['transform_count']} "
+                f"pose transform(s) and {result['lock_count']} lock(s), rebound "
+                f"{result['restored_modifier_count']} Armature modifier(s)."
             ),
         )
         return {"FINISHED"}

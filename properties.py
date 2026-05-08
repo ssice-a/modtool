@@ -8,17 +8,6 @@ def _mesh_object_poll(_self, obj):
     return obj is not None and getattr(obj, "type", None) == "MESH"
 
 
-def _mark_manual_group_match(item, _context):
-    """Promote an edited mapping row to manual mode."""
-    if getattr(item, "status", "") == "MANUAL":
-        return
-    item.status = "MANUAL"
-    item.confidence = 0.0
-    item.score_overlap = 0.0
-    item.score_centroid = 0.0
-    item.reason = "Manual mapping."
-
-
 class MDT_PG_RenameSettings(bpy.types.PropertyGroup):
     """Settings used by the vertex-group rename tool."""
 
@@ -97,11 +86,11 @@ class MDT_PG_RenameSettings(bpy.types.PropertyGroup):
 
 
 class MDT_PG_GroupMatchSettings(bpy.types.PropertyGroup):
-    """Settings used for source-to-target vertex-group mapping analysis."""
+    """Settings used for source-to-target vertex-group mapping."""
 
     source_object: bpy.props.PointerProperty(
         name="Source",
-        description="Mesh object whose vertex-group names will be analyzed and later renamed",
+        description="Mesh object whose deform-bone vertex groups will be renamed",
         type=bpy.types.Object,
         poll=_mesh_object_poll,
     )
@@ -113,59 +102,31 @@ class MDT_PG_GroupMatchSettings(bpy.types.PropertyGroup):
         poll=_mesh_object_poll,
     )
 
-    candidate_limit: bpy.props.IntProperty(
-        name="Candidate Limit",
-        description="How many top target candidates to keep per source group during analysis",
-        default=3,
-        min=1,
-        max=8,
-    )
-
-    surface_tolerance: bpy.props.FloatProperty(
-        name="Surface Tolerance",
-        description="Maximum world-space distance used when projecting source vertices onto the target surface",
-        default=0.001,
-        min=0.0,
-        soft_min=0.000001,
-        soft_max=0.05,
-        precision=6,
-    )
-
-    prefer_deform_groups: bpy.props.BoolProperty(
-        name="Prefer Deform Groups",
-        description="When possible, only analyze target groups that match deform bones from armature modifiers",
-        default=True,
-    )
-
 
 class MDT_PG_GroupMatchResultItem(bpy.types.PropertyGroup):
-    """One source-to-target rename suggestion inferred from mesh analysis."""
+    """One source-to-target rename row inferred from spatial weight matching."""
 
     source_group: bpy.props.StringProperty(
         name="Source Group",
         description="Source vertex-group name that may be renamed",
         default="",
-        update=_mark_manual_group_match,
     )
 
     target_group: bpy.props.StringProperty(
         name="Suggested Target",
         description="Suggested target vertex-group name",
         default="",
-        update=_mark_manual_group_match,
     )
 
     status: bpy.props.EnumProperty(
         name="Status",
         description="Mapping confidence status",
         items=(
-            ("DIRECT", "Direct", "A high-confidence one-to-one rename suggestion"),
-            ("MANUAL", "Manual", "A manually edited rename mapping"),
-            ("AMBIGUOUS", "Ambiguous", "Multiple target candidates scored too closely"),
-            ("UNMATCHED", "Unmatched", "No stable target group could be inferred"),
-            ("CONFLICT", "Conflict", "Another source group claimed the same target more strongly"),
+            ("DIRECT", "Direct", "A one-to-one spatial rename match"),
+            ("MERGE", "Merge", "Multiple source groups should be merged into one target group"),
+            ("FALLBACK", "Fallback", "A low-confidence mapping used to keep every source bone group mapped"),
         ),
-        default="UNMATCHED",
+        default="FALLBACK",
     )
 
     confidence: bpy.props.FloatProperty(
@@ -178,8 +139,8 @@ class MDT_PG_GroupMatchResultItem(bpy.types.PropertyGroup):
     )
 
     score_overlap: bpy.props.FloatProperty(
-        name="Overlap",
-        description="Weight-field overlap score between source and target groups",
+        name="Cloud",
+        description="Spatial weight-cloud vote score between source and target groups",
         default=0.0,
         min=0.0,
         max=1.0,
@@ -289,13 +250,10 @@ def register_addon_properties():
     bpy.types.Scene.mdt_group_match_settings = bpy.props.PointerProperty(type=MDT_PG_GroupMatchSettings)
     bpy.types.Scene.mdt_shape_key_settings = bpy.props.PointerProperty(type=MDT_PG_ShapeKeyTransferSettings)
     bpy.types.Scene.mdt_group_match_results = bpy.props.CollectionProperty(type=MDT_PG_GroupMatchResultItem)
-    bpy.types.Scene.mdt_active_group_match_result_index = bpy.props.IntProperty(default=0, min=0)
 
 
 def unregister_addon_properties():
     """Remove addon PointerProperties and collections from Scene."""
-    if hasattr(bpy.types.Scene, "mdt_active_group_match_result_index"):
-        del bpy.types.Scene.mdt_active_group_match_result_index
     if hasattr(bpy.types.Scene, "mdt_group_match_results"):
         del bpy.types.Scene.mdt_group_match_results
     if hasattr(bpy.types.Scene, "mdt_shape_key_settings"):

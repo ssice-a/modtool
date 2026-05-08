@@ -15,8 +15,8 @@ class MDT_OT_create_named_materials(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
-    def poll(cls, context):
-        return len(get_selected_mesh_objects(context)) > 0
+    def poll(cls, _context):
+        return True
 
     def execute(self, context):
         mesh_objects = get_selected_mesh_objects(context)
@@ -61,8 +61,8 @@ class MDT_OT_separate_by_material(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
-    def poll(cls, context):
-        return len(get_selected_mesh_objects(context)) > 0
+    def poll(cls, _context):
+        return True
 
     def execute(self, context):
         mesh_objects = get_selected_mesh_objects(context)
