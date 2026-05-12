@@ -6,7 +6,7 @@ from ..core.common import ensure_object_mode, restore_context_mode
 from ..core.group_mapping import (
     analyze_group_mapping,
     apply_group_mapping_rename,
-    count_group_match_status,
+    count_group_match_statuses,
     resolve_group_mapping_objects,
     store_group_match_rows,
 )
@@ -57,15 +57,15 @@ class MDT_OT_rename_groups_from_target(bpy.types.Operator):
             self.report({"WARNING"}, "No target vertex-group names could be applied.")
             return {"CANCELLED"}
 
-        direct_count = count_group_match_status(scene, "DIRECT")
-        merge_count = count_group_match_status(scene, "MERGE")
-        fallback_count = count_group_match_status(scene, "FALLBACK")
+        status_counts = count_group_match_statuses(scene)
         removed_count = result["removed_non_deform_count"] + result["removed_unmapped_deform_count"]
 
         message = (
             f"Renamed to {result['created_count']} target group(s) from "
             f"{result['mapped_source_count']} source group(s). "
-            f"Direct: {direct_count}, Merge: {merge_count}, Fallback: {fallback_count}."
+            f"Direct: {status_counts['DIRECT']}, "
+            f"Merge: {status_counts['MERGE']}, "
+            f"Fallback: {status_counts['FALLBACK']}."
         )
         if removed_count > 0:
             message += f" Removed {removed_count} helper/unmapped group(s)."

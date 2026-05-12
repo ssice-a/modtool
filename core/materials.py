@@ -1,18 +1,28 @@
 """Material helpers used by the modding workflow."""
 
+from array import array
+
+
+def _read_polygon_material_indices(mesh):
+    material_indices = array("i", [0]) * len(mesh.polygons)
+    if material_indices:
+        mesh.polygons.foreach_get("material_index", material_indices)
+    return material_indices
+
 
 def assign_single_material_to_object(obj, material):
     """Replace all material slots with one material and assign it to every polygon."""
     mesh = obj.data
     mesh.materials.clear()
     mesh.materials.append(material)
-    for polygon in mesh.polygons:
-        polygon.material_index = 0
+    if len(mesh.polygons) > 0:
+        mesh.polygons.foreach_set("material_index", array("i", [0]) * len(mesh.polygons))
+        mesh.update()
 
 
 def resolve_used_material(obj):
     """Return the first material actually used by this mesh object's polygons."""
-    used_indices = sorted({polygon.material_index for polygon in obj.data.polygons})
+    used_indices = sorted(set(_read_polygon_material_indices(obj.data)))
     for material_index in used_indices:
         if material_index >= len(obj.material_slots):
             continue

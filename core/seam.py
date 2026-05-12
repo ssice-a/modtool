@@ -110,12 +110,17 @@ def build_vertex_pairs(source_vertices, target_vertices, tolerance):
     return matched_pairs, unmatched_source, unmatched_target
 
 
-def read_vertex_weights(obj, vertex_index):
+def read_vertex_weights(obj, vertex_index, group_names_by_index=None):
     """Read positive vertex-group weights from one vertex."""
+    if group_names_by_index is None:
+        group_names_by_index = {group.index: group.name for group in obj.vertex_groups}
+
     weight_map = {}
     vertex = obj.data.vertices[vertex_index]
     for assignment in vertex.groups:
-        group_name = obj.vertex_groups[assignment.group].name
+        group_name = group_names_by_index.get(assignment.group)
+        if group_name is None:
+            continue
         if assignment.weight > _WEIGHT_EPSILON:
             weight_map[group_name] = assignment.weight
     return weight_map
@@ -167,10 +172,16 @@ def _accumulate_mapping_candidates(candidate_stats, source_items, target_items, 
 def build_mapping_candidates(source_obj, target_obj, matched_pairs, weight_tolerance):
     """Infer source-to-target vertex-group rename candidates from matching seam weights."""
     candidate_stats = {}
+    source_group_names_by_index = {group.index: group.name for group in source_obj.vertex_groups}
+    target_group_names_by_index = {group.index: group.name for group in target_obj.vertex_groups}
 
     for source_index, target_index in matched_pairs:
-        source_items = _sorted_weight_items(read_vertex_weights(source_obj, source_index))
-        target_items = _sorted_weight_items(read_vertex_weights(target_obj, target_index))
+        source_items = _sorted_weight_items(
+            read_vertex_weights(source_obj, source_index, source_group_names_by_index)
+        )
+        target_items = _sorted_weight_items(
+            read_vertex_weights(target_obj, target_index, target_group_names_by_index)
+        )
 
         if not source_items or not target_items:
             continue

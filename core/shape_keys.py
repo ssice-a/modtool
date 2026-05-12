@@ -9,7 +9,7 @@ import bpy
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-from .common import is_mesh_object, run_object_operator, sync_edit_mesh_data
+from .common import get_point_coordinates, is_mesh_object, run_object_operator, sync_edit_mesh_data
 
 
 _TRIANGLE_RELATIVE_EPSILON = 1.0e-12
@@ -75,8 +75,8 @@ def resolve_transfer_objects(context, settings):
 def _get_basis_coordinates(obj):
     shape_keys = getattr(obj.data, "shape_keys", None)
     if shape_keys is not None and len(shape_keys.key_blocks) > 0:
-        return [point.co.copy() for point in shape_keys.key_blocks[0].data]
-    return [vertex.co.copy() for vertex in obj.data.vertices]
+        return get_point_coordinates(shape_keys.key_blocks[0].data)
+    return get_point_coordinates(obj.data.vertices)
 
 
 def _build_loop_triangles(obj):
@@ -793,7 +793,7 @@ def transfer_shape_keys(source_obj, target_obj, samples, replace_existing=True):
         raise ValueError("There are no cached target samples to transfer.")
 
     target_basis_key = ensure_basis_shape_key(target_obj)
-    target_basis = [point.co.copy() for point in target_basis_key.data]
+    target_basis = get_point_coordinates(target_basis_key.data)
     source_linear = source_obj.matrix_world.to_3x3()
     target_linear_inverse = target_obj.matrix_world.inverted().to_3x3()
 
@@ -849,7 +849,7 @@ def transfer_shape_keys_by_vertex(source_obj, target_obj, samples, replace_exist
 
     target_basis_key = ensure_basis_shape_key(target_obj)
     source_basis = _get_basis_coordinates(source_obj)
-    target_basis = [point.co.copy() for point in target_basis_key.data]
+    target_basis = get_point_coordinates(target_basis_key.data)
     source_linear = source_obj.matrix_world.to_3x3()
     target_linear_inverse = target_obj.matrix_world.inverted().to_3x3()
 
@@ -990,7 +990,7 @@ def _capture_evaluated_vertex_coordinates(obj, depsgraph):
     evaluated_obj = obj.evaluated_get(depsgraph)
     evaluated_mesh = evaluated_obj.to_mesh()
     try:
-        return [vertex.co.copy() for vertex in evaluated_mesh.vertices]
+        return get_point_coordinates(evaluated_mesh.vertices)
     finally:
         evaluated_obj.to_mesh_clear()
 
@@ -1084,7 +1084,7 @@ def transfer_shape_keys_by_wrap(context, source_obj, target_obj, replace_existin
 
         reference_coordinates = capture_target_pose(relative_source_key)
         full_coordinates = capture_target_pose(source_key)
-        target_relative_coordinates = [point.co.copy() for point in target_relative_key.data]
+        target_relative_coordinates = get_point_coordinates(target_relative_key.data)
 
         target_key = target_obj.shape_key_add(name=source_key.name, from_mix=False)
         _copy_shape_key_metadata(source_key, target_key, value_override=0.0, mute_override=True)

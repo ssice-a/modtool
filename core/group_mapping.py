@@ -10,7 +10,7 @@ import bpy
 from mathutils import Vector
 from mathutils.kdtree import KDTree
 
-from .common import is_mesh_object, sync_edit_mesh_data
+from .common import get_world_point_coordinates, is_mesh_object, sync_edit_mesh_data
 
 
 _WEIGHT_EPSILON = 1.0e-8
@@ -79,13 +79,11 @@ def _capture_world_positions(obj, depsgraph):
         )
         try:
             if len(evaluated_mesh.vertices) == len(obj.data.vertices):
-                matrix_world = evaluated_obj.matrix_world
-                return [matrix_world @ vertex.co for vertex in evaluated_mesh.vertices], True
+                return get_world_point_coordinates(evaluated_mesh.vertices, evaluated_obj.matrix_world), True
         finally:
             bpy.data.meshes.remove(evaluated_mesh)
 
-    matrix_world = obj.matrix_world
-    return [matrix_world @ vertex.co for vertex in obj.data.vertices], False
+    return get_world_point_coordinates(obj.data.vertices, obj.matrix_world), False
 
 
 def _collect_vertex_group_data(obj, allowed_group_names=None, world_positions=None):
@@ -98,8 +96,7 @@ def _collect_vertex_group_data(obj, allowed_group_names=None, world_positions=No
     group_weighted_world_sum = defaultdict(lambda: Vector((0.0, 0.0, 0.0)))
 
     if world_positions is None:
-        matrix_world = obj.matrix_world
-        world_positions = [matrix_world @ vertex.co for vertex in obj.data.vertices]
+        world_positions = get_world_point_coordinates(obj.data.vertices, obj.matrix_world)
 
     for vertex in obj.data.vertices:
         vertex_weight_map = {}
@@ -368,6 +365,7 @@ def _build_candidates_by_source(
     vote_scores,
     vote_coverage,
 ):
+    target_group_name_set = set(target_group_names)
     source_positions = source_group_data["world_positions"]
     target_positions = target_group_data["world_positions"]
     bbox_positions = source_positions[:20000] + target_positions[:20000]
@@ -381,7 +379,7 @@ def _build_candidates_by_source(
     candidates_by_source = {}
     for source_group in source_group_data["group_names"]:
         candidate_target_names = set(vote_scores.get(source_group, {}))
-        if source_group in target_group_names:
+        if source_group in target_group_name_set:
             candidate_target_names.add(source_group)
         candidate_target_names.update(normalized_targets.get(_normalized_group_name(source_group), ()))
 
@@ -650,9 +648,13 @@ def store_group_match_rows(scene, rows):
         item.reason = row["reason"]
 
 
-def count_group_match_status(scene, status):
-    """Count how many stored vertex-group mappings share the requested status."""
-    return sum(1 for item in scene.mdt_group_match_results if item.status == status)
+def count_group_match_statuses(scene):
+    """Count stored vertex-group mapping statuses in one pass."""
+    counts = {"DIRECT": 0, "MERGE": 0, "FALLBACK": 0}
+    for item in scene.mdt_group_match_results:
+        if item.status in counts:
+            counts[item.status] += 1
+    return counts
 
 
 def analyze_group_mapping(source_obj, target_obj, depsgraph=None):
@@ -772,10 +774,11 @@ def apply_group_mapping_rename(source_obj, target_obj, mapping_items):
     sync_edit_mesh_data(source_obj)
     original_group_names = [group.name for group in source_obj.vertex_groups]
     original_weights_by_name = _capture_group_weights(source_obj)
+    source_deform_bone_map = _resolve_deform_bone_map(source_obj)
     source_deform_names = {
         name
         for name in original_group_names
-        if name in _resolve_deform_bone_map(source_obj)
+        if name in source_deform_bone_map
     }
     for source_name in source_deform_names:
         original_weights_by_name.setdefault(source_name, {})

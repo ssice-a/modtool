@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from array import array
+
 import bpy
+from mathutils import Vector
 
 
 _MODE_RESTORE_MAP = {
@@ -31,6 +34,44 @@ def sync_edit_mesh_data(obj):
     """Push edit-mode changes back to the mesh before reading geometry data."""
     if obj is not None and getattr(obj, "mode", "OBJECT") == "EDIT":
         obj.update_from_editmode()
+
+
+def get_flat_point_coordinates(points):
+    """Read local point coordinates with Blender's bulk RNA API."""
+    flat_coordinates = array("f", [0.0]) * (len(points) * 3)
+    points.foreach_get("co", flat_coordinates)
+    return flat_coordinates
+
+
+def get_point_coordinates(points):
+    """Read local point coordinates as mathutils vectors."""
+    flat_coordinates = get_flat_point_coordinates(points)
+    return [
+        Vector(
+            (
+                flat_coordinates[coordinate_index],
+                flat_coordinates[coordinate_index + 1],
+                flat_coordinates[coordinate_index + 2],
+            )
+        )
+        for coordinate_index in range(0, len(flat_coordinates), 3)
+    ]
+
+
+def get_world_point_coordinates(points, matrix_world):
+    """Read point coordinates and transform them into world space."""
+    flat_coordinates = get_flat_point_coordinates(points)
+    return [
+        matrix_world
+        @ Vector(
+            (
+                flat_coordinates[coordinate_index],
+                flat_coordinates[coordinate_index + 1],
+                flat_coordinates[coordinate_index + 2],
+            )
+        )
+        for coordinate_index in range(0, len(flat_coordinates), 3)
+    ]
 
 
 def ensure_object_mode(context):

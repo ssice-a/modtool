@@ -205,16 +205,6 @@ def apply_exact_name_pairs(obj, name_pairs):
     }
 
 
-def count_empty_vertex_groups(obj):
-    """Count vertex groups that have no effective non-zero weights on any vertex."""
-    if obj is None:
-        return 0
-
-    used_group_indices = _collect_weighted_group_indices(obj)
-
-    return sum(1 for group in getattr(obj, "vertex_groups", []) if group.index not in used_group_indices)
-
-
 def _collect_weighted_group_indices(obj):
     used_group_indices = set()
     for vertex in getattr(obj.data, "vertices", []):
@@ -258,11 +248,6 @@ def _resolve_deforming_bone_names(obj):
     return bone_names
 
 
-def has_deforming_armature_groups(obj):
-    """Return True when the mesh has armature deform bones that can use vertex groups."""
-    return bool(_resolve_deforming_bone_names(obj))
-
-
 def _keepable_deforming_group_names(obj):
     deforming_bone_names = _resolve_deforming_bone_names(obj)
     if not deforming_bone_names:
@@ -275,17 +260,6 @@ def _keepable_deforming_group_names(obj):
         if group.name in deforming_bone_names and group.index in weighted_group_indices
     }
     return keep_names, deforming_bone_names
-
-
-def count_non_deforming_vertex_groups(obj):
-    """Count groups that are not weighted deform-bone groups used by an armature."""
-    if obj is None:
-        return 0
-
-    keep_names, deforming_bone_names = _keepable_deforming_group_names(obj)
-    if not deforming_bone_names:
-        return 0
-    return sum(1 for group in getattr(obj, "vertex_groups", []) if group.name not in keep_names)
 
 
 def remove_non_deforming_vertex_groups(obj):

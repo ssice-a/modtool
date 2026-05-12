@@ -127,32 +127,6 @@ def _is_target_pose_bone(pose_bone, bone_names):
     return bone_names is None or pose_bone.name in bone_names
 
 
-def _count_locked_vector_channels(pose_bone, attribute_name):
-    return sum(1 for is_locked in getattr(pose_bone, attribute_name, ()) if is_locked)
-
-
-def count_pose_locks(armature_obj, bone_names=None):
-    """Count transform, IK, and selection locks on pose bones."""
-    if not is_armature_object(armature_obj) or armature_obj.pose is None:
-        return 0
-
-    target_bone_names = set(bone_names) if bone_names is not None else None
-    lock_count = 0
-    for pose_bone in armature_obj.pose.bones:
-        if not _is_target_pose_bone(pose_bone, target_bone_names):
-            continue
-
-        for attribute_name in _POSE_VECTOR_LOCK_ATTRIBUTES:
-            lock_count += _count_locked_vector_channels(pose_bone, attribute_name)
-        for attribute_name in _POSE_BOOL_LOCK_ATTRIBUTES + _POSE_IK_LIMIT_ATTRIBUTES:
-            if getattr(pose_bone, attribute_name, False):
-                lock_count += 1
-        for attribute_name in _BONE_ACCESS_LOCK_ATTRIBUTES:
-            if getattr(pose_bone.bone, attribute_name, False):
-                lock_count += 1
-    return lock_count
-
-
 def remove_pose_constraints(armature_obj):
     """Remove every pose-bone constraint from an armature."""
     if not is_armature_object(armature_obj) or armature_obj.pose is None:
@@ -172,18 +146,24 @@ def clear_pose_locks(armature_obj, bone_names=None):
         return 0
 
     target_bone_names = set(bone_names) if bone_names is not None else None
-    cleared_count = count_pose_locks(armature_obj, target_bone_names)
+    cleared_count = 0
     for pose_bone in armature_obj.pose.bones:
         if not _is_target_pose_bone(pose_bone, target_bone_names):
             continue
 
+        for attribute_name in _POSE_VECTOR_LOCK_ATTRIBUTES:
+            cleared_count += sum(1 for is_locked in getattr(pose_bone, attribute_name, ()) if is_locked)
         pose_bone.lock_location = (False, False, False)
         pose_bone.lock_rotation = (False, False, False)
         pose_bone.lock_scale = (False, False, False)
         for attribute_name in _POSE_BOOL_LOCK_ATTRIBUTES + _POSE_IK_LIMIT_ATTRIBUTES:
+            if getattr(pose_bone, attribute_name, False):
+                cleared_count += 1
             if hasattr(pose_bone, attribute_name):
                 setattr(pose_bone, attribute_name, False)
         for attribute_name in _BONE_ACCESS_LOCK_ATTRIBUTES:
+            if getattr(pose_bone.bone, attribute_name, False):
+                cleared_count += 1
             if hasattr(pose_bone.bone, attribute_name):
                 setattr(pose_bone.bone, attribute_name, False)
     return cleared_count

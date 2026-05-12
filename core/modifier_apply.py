@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from array import array
-
 import bpy
 
-from .common import is_mesh_object, sync_edit_mesh_data
+from .common import get_flat_point_coordinates, is_mesh_object, sync_edit_mesh_data
 
 
 _TEMP_DELETE_MASK_NAME = "MDT_DeleteKeepShapeKeys"
@@ -237,8 +235,7 @@ def _capture_flat_vertex_coordinates(obj, depsgraph, expected_vertex_count=None)
                 f"Expected {expected_vertex_count} vertices, got {vertex_count}."
             )
 
-        flat_coordinates = array("f", [0.0]) * (vertex_count * 3)
-        evaluated_mesh.vertices.foreach_get("co", flat_coordinates)
+        flat_coordinates = get_flat_point_coordinates(evaluated_mesh.vertices)
         return flat_coordinates, vertex_count
     finally:
         evaluated_obj.to_mesh_clear()
