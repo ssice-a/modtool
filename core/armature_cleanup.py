@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import bpy
 
-from .common import get_selected_mesh_objects, is_mesh_object, run_object_operator
+from .common import get_selected_mesh_objects, is_armature_object, is_mesh_object, run_object_operator
 from .modifier_apply import apply_modifier_with_shape_keys, get_enabled_modifier_names, has_shape_keys
 
 
@@ -25,11 +25,6 @@ _POSE_IK_LIMIT_ATTRIBUTES = (
     "use_ik_rotation_control",
 )
 _BONE_ACCESS_LOCK_ATTRIBUTES = ("hide", "hide_select")
-
-
-def is_armature_object(obj):
-    """Return True when the object is an armature."""
-    return obj is not None and getattr(obj, "type", None) == "ARMATURE"
 
 
 def mesh_uses_armature(obj, armature_obj):

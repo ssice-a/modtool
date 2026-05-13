@@ -8,6 +8,11 @@ def _mesh_object_poll(_self, obj):
     return obj is not None and getattr(obj, "type", None) == "MESH"
 
 
+def _armature_object_poll(_self, obj):
+    """Restrict object pickers to armature objects."""
+    return obj is not None and getattr(obj, "type", None) == "ARMATURE"
+
+
 class MDT_PG_RenameSettings(bpy.types.PropertyGroup):
     """Settings used by the vertex-group rename tool."""
 
@@ -236,11 +241,42 @@ class MDT_PG_ShapeKeyTransferSettings(bpy.types.PropertyGroup):
     )
 
 
+class MDT_PG_BoneMergeSettings(bpy.types.PropertyGroup):
+    """Settings used to transfer selected source rest bones into a target armature."""
+
+    source_object: bpy.props.PointerProperty(
+        name="Source",
+        description="Armature whose selected bones provide the body rest shape",
+        type=bpy.types.Object,
+        poll=_armature_object_poll,
+    )
+
+    target_object: bpy.props.PointerProperty(
+        name="Target",
+        description="Armature that will receive the selected source bones",
+        type=bpy.types.Object,
+        poll=_armature_object_poll,
+    )
+
+    captured_bone_names: bpy.props.StringProperty(
+        name="Captured Bones",
+        description="Internal newline-separated list of selected source bone names",
+        default="",
+    )
+
+    use_source_parenting: bpy.props.BoolProperty(
+        name="Use Source Parents",
+        description="Reconnect transferred bones using the source bone parent chain when possible",
+        default=True,
+    )
+
+
 REGISTERED_CLASSES = (
     MDT_PG_RenameSettings,
     MDT_PG_GroupMatchSettings,
     MDT_PG_GroupMatchResultItem,
     MDT_PG_ShapeKeyTransferSettings,
+    MDT_PG_BoneMergeSettings,
 )
 
 
@@ -249,6 +285,7 @@ def register_addon_properties():
     bpy.types.Scene.mdt_rename_settings = bpy.props.PointerProperty(type=MDT_PG_RenameSettings)
     bpy.types.Scene.mdt_group_match_settings = bpy.props.PointerProperty(type=MDT_PG_GroupMatchSettings)
     bpy.types.Scene.mdt_shape_key_settings = bpy.props.PointerProperty(type=MDT_PG_ShapeKeyTransferSettings)
+    bpy.types.Scene.mdt_bone_merge_settings = bpy.props.PointerProperty(type=MDT_PG_BoneMergeSettings)
     bpy.types.Scene.mdt_group_match_results = bpy.props.CollectionProperty(type=MDT_PG_GroupMatchResultItem)
 
 
@@ -258,6 +295,8 @@ def unregister_addon_properties():
         del bpy.types.Scene.mdt_group_match_results
     if hasattr(bpy.types.Scene, "mdt_shape_key_settings"):
         del bpy.types.Scene.mdt_shape_key_settings
+    if hasattr(bpy.types.Scene, "mdt_bone_merge_settings"):
+        del bpy.types.Scene.mdt_bone_merge_settings
     if hasattr(bpy.types.Scene, "mdt_group_match_settings"):
         del bpy.types.Scene.mdt_group_match_settings
     if hasattr(bpy.types.Scene, "mdt_rename_settings"):

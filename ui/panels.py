@@ -3,6 +3,7 @@
 import bpy
 
 from ..core.common import is_mesh_object
+from ..core.bone_merge import parse_bone_names, resolve_bone_merge_armatures
 from ..core.group_mapping import resolve_group_mapping_objects
 from ..core.shape_keys import resolve_transfer_objects
 
@@ -168,6 +169,24 @@ class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+
+        merge_settings = context.scene.mdt_bone_merge_settings
+        source_obj, target_obj = resolve_bone_merge_armatures(context, merge_settings)
+        captured_bone_count = len(parse_bone_names(merge_settings.captured_bone_names))
+
+        merge_box = layout.box()
+        merge_box.label(text="Bone Merge", icon="ARMATURE_DATA")
+        merge_col = merge_box.column(align=True)
+        merge_col.prop(merge_settings, "source_object")
+        merge_col.prop(merge_settings, "target_object")
+        merge_col.prop(merge_settings, "use_source_parenting")
+        merge_col.operator("mdt.capture_bone_merge_selection", icon="RESTRICT_SELECT_OFF")
+        merge_box.label(text=f"Captured bones: {captured_bone_count}", icon="BONE_DATA")
+
+        merge_row = merge_box.row(align=True)
+        merge_row.enabled = source_obj is not None and target_obj is not None and captured_bone_count > 0
+        merge_row.operator("mdt.analyze_bone_merge", icon="VIEWZOOM")
+        merge_row.operator("mdt.apply_bone_merge", icon="CHECKMARK")
 
         box = layout.box()
         box.label(text="FK Cleanup", icon="ARMATURE_DATA")

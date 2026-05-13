@@ -25,6 +25,11 @@ def is_mesh_object(obj):
     return obj is not None and getattr(obj, "type", None) == "MESH"
 
 
+def is_armature_object(obj):
+    """Return True when the object is an armature."""
+    return obj is not None and getattr(obj, "type", None) == "ARMATURE"
+
+
 def get_selected_mesh_objects(context):
     """Return every selected mesh object in the current view layer."""
     return [obj for obj in getattr(context, "selected_objects", []) if is_mesh_object(obj)]
