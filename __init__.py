@@ -12,6 +12,7 @@ bl_info = {
 
 import bpy
 
+from .core import pose_mirror
 from . import properties
 from .ops import REGISTERED_CLASSES as OPERATOR_CLASSES
 from .ui import REGISTERED_CLASSES as UI_CLASSES
@@ -25,10 +26,12 @@ def register():
     for blender_class in REGISTERED_CLASSES:
         bpy.utils.register_class(blender_class)
     properties.register_addon_properties()
+    pose_mirror.register_pose_mirror_handler()
 
 
 def unregister():
     """Unregister addon classes and properties."""
+    pose_mirror.unregister_pose_mirror_handler()
     properties.unregister_addon_properties()
     for blender_class in reversed(REGISTERED_CLASSES):
         bpy.utils.unregister_class(blender_class)

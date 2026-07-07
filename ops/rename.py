@@ -6,8 +6,11 @@ from ..core.common import is_mesh_object
 from ..core.rename import (
     apply_rename_plan,
     build_rename_plan,
+    clean_disconnected_vertex_group_weights,
     has_rename_rule,
+    mirror_vertex_group_weights_x,
     remove_empty_vertex_groups,
+    remove_non_body_vertex_groups,
     remove_non_deforming_vertex_groups,
     reset_rename_settings,
     resolve_final_names,
@@ -93,6 +96,42 @@ class MDT_OT_remove_empty_vertex_groups(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MDT_OT_clean_disconnected_vertex_group_weights(bpy.types.Operator):
+    """Keep each vertex group to its largest connected weight island."""
+
+    bl_idname = "mdt.clean_disconnected_vertex_group_weights"
+    bl_label = "Clean Islands"
+    bl_description = "Remove disconnected weight islands from each vertex group, keeping the largest connected region"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return is_mesh_object(obj) and len(getattr(obj, "vertex_groups", [])) > 0
+
+    def execute(self, context):
+        obj = context.object
+        try:
+            result = clean_disconnected_vertex_group_weights(obj)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        if result["removed_weight_count"] == 0:
+            self.report({"INFO"}, "No disconnected weight islands were found.")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"Cleaned {result['cleaned_group_count']} group(s), "
+                f"removed {result['removed_weight_count']} weight(s) from "
+                f"{result['removed_component_count']} island(s)."
+            ),
+        )
+        return {"FINISHED"}
+
+
 class MDT_OT_keep_deforming_vertex_groups(bpy.types.Operator):
     """Keep only weighted vertex groups that are controlled by deform bones."""
 
@@ -124,5 +163,94 @@ class MDT_OT_keep_deforming_vertex_groups(bpy.types.Operator):
         )
         if result["removed_empty_deform_count"] > 0:
             message += f" Empty deform groups: {result['removed_empty_deform_count']}."
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class MDT_OT_keep_body_vertex_groups(bpy.types.Operator):
+    """Fold non-body weights into parent body groups and remove the folded groups."""
+
+    bl_idname = "mdt.keep_body_vertex_groups"
+    bl_label = "Keep Body Groups"
+    bl_description = "Merge clothing, physics, and accessory weights into parent body groups, then delete those groups"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return is_mesh_object(obj) and len(getattr(obj, "vertex_groups", [])) > 0
+
+    def execute(self, context):
+        obj = context.object
+        armature_objects = [scene_obj for scene_obj in context.scene.objects if getattr(scene_obj, "type", None) == "ARMATURE"]
+        try:
+            result = remove_non_body_vertex_groups(obj, armature_objects)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        if result["removed_count"] == 0:
+            self.report({"INFO"}, "No foldable non-body vertex groups were found.")
+            return {"CANCELLED"}
+
+        message = (
+            f"Kept {result['kept_count']} body group(s), "
+            f"folded {result['folded_group_count']} group(s), "
+            f"removed {result['removed_count']} group(s)."
+        )
+        if result["skipped_weighted_unmapped_count"] > 0:
+            message += f" Skipped {result['skipped_weighted_unmapped_count']} weighted unmapped group(s)."
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class MDT_OT_mirror_vertex_group_weights(bpy.types.Operator):
+    """Mirror recognized left/right vertex-group pairs without renaming groups."""
+
+    bl_idname = "mdt.mirror_vertex_group_weights"
+    bl_label = "Mirror Paired Groups"
+    bl_description = "Mirror recognized L/R vertex-group pairs without changing vertex-group names"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: bpy.props.EnumProperty(
+        name="Direction",
+        items=(
+            ("LEFT_TO_RIGHT", "L to R", "Mirror left vertex groups to their right-side partners"),
+            ("RIGHT_TO_LEFT", "R to L", "Mirror right vertex groups to their left-side partners"),
+        ),
+        default="LEFT_TO_RIGHT",
+    )
+
+    tolerance: bpy.props.FloatProperty(
+        name="Tolerance",
+        description="Mirror distance in local space; 0 uses an automatic tolerance",
+        default=0.0,
+        min=0.0,
+        precision=6,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return is_mesh_object(obj) and len(getattr(obj, "vertex_groups", [])) > 0
+
+    def execute(self, context):
+        obj = context.object
+        try:
+            result = mirror_vertex_group_weights_x(
+                obj,
+                direction=self.direction,
+                tolerance=self.tolerance,
+            )
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        message = (
+            f"Mirrored {result['mirrored_group_count']} target group(s) from "
+            f"{result['pair_count']} pair(s), wrote {result['written_weight_count']} weight(s)."
+        )
+        if result["unmatched_vertex_count"] > 0:
+            message += f" Unmatched source vertices: {result['unmatched_vertex_count']}."
         self.report({"INFO"}, message)
         return {"FINISHED"}

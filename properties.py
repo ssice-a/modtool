@@ -13,6 +13,23 @@ def _armature_object_poll(_self, obj):
     return obj is not None and getattr(obj, "type", None) == "ARMATURE"
 
 
+def _pose_mirror_enabled_update(_self, _context):
+    from .core.pose_mirror import clear_pose_mirror_state
+
+    clear_pose_mirror_state()
+
+
+class MDT_PG_PoseMirrorSettings(bpy.types.PropertyGroup):
+    """Settings for lightweight automatic pose mirroring."""
+
+    enabled: bpy.props.BoolProperty(
+        name="Smart Pose Mirror",
+        description="Mirror selected pose-bone transforms to the opposite side while editing in Pose Mode",
+        default=False,
+        update=_pose_mirror_enabled_update,
+    )
+
+
 class MDT_PG_RenameSettings(bpy.types.PropertyGroup):
     """Settings used by the vertex-group rename tool."""
 
@@ -272,6 +289,7 @@ class MDT_PG_BoneMergeSettings(bpy.types.PropertyGroup):
 
 
 REGISTERED_CLASSES = (
+    MDT_PG_PoseMirrorSettings,
     MDT_PG_RenameSettings,
     MDT_PG_GroupMatchSettings,
     MDT_PG_GroupMatchResultItem,
@@ -282,6 +300,7 @@ REGISTERED_CLASSES = (
 
 def register_addon_properties():
     """Register addon PointerProperties and collections on Scene."""
+    bpy.types.Scene.mdt_pose_mirror_settings = bpy.props.PointerProperty(type=MDT_PG_PoseMirrorSettings)
     bpy.types.Scene.mdt_rename_settings = bpy.props.PointerProperty(type=MDT_PG_RenameSettings)
     bpy.types.Scene.mdt_group_match_settings = bpy.props.PointerProperty(type=MDT_PG_GroupMatchSettings)
     bpy.types.Scene.mdt_shape_key_settings = bpy.props.PointerProperty(type=MDT_PG_ShapeKeyTransferSettings)
@@ -291,6 +310,8 @@ def register_addon_properties():
 
 def unregister_addon_properties():
     """Remove addon PointerProperties and collections from Scene."""
+    if hasattr(bpy.types.Scene, "mdt_pose_mirror_settings"):
+        del bpy.types.Scene.mdt_pose_mirror_settings
     if hasattr(bpy.types.Scene, "mdt_group_match_results"):
         del bpy.types.Scene.mdt_group_match_results
     if hasattr(bpy.types.Scene, "mdt_shape_key_settings"):

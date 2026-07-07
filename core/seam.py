@@ -126,6 +126,113 @@ def read_vertex_weights(obj, vertex_index, group_names_by_index=None):
     return weight_map
 
 
+def _ensure_vertex_groups(obj, group_names):
+    groups_by_name = {group.name: group for group in obj.vertex_groups}
+    for group_name in group_names:
+        if group_name not in groups_by_name:
+            groups_by_name[group_name] = obj.vertex_groups.new(name=group_name)
+    return groups_by_name
+
+
+def _build_seam_weight_update_plan(source_obj, target_obj, matched_pairs):
+    source_group_names_by_index = {group.index: group.name for group in source_obj.vertex_groups}
+    target_group_names_by_index = {group.index: group.name for group in target_obj.vertex_groups}
+    removals_by_group_name = {}
+    additions_by_group_name = {}
+    copied_target_group_names = set()
+
+    for source_index, target_index in matched_pairs:
+        source_vertex = source_obj.data.vertices[source_index]
+        for assignment in source_vertex.groups:
+            if assignment.weight <= _WEIGHT_EPSILON:
+                continue
+            group_name = source_group_names_by_index.get(assignment.group)
+            if group_name is None:
+                continue
+            removals_by_group_name.setdefault(group_name, []).append(source_index)
+
+        target_weights = read_vertex_weights(target_obj, target_index, target_group_names_by_index)
+        for group_name, weight in target_weights.items():
+            if weight <= _WEIGHT_EPSILON:
+                continue
+            additions_by_group_name.setdefault(group_name, []).append((source_index, min(1.0, float(weight))))
+            copied_target_group_names.add(group_name)
+
+    return removals_by_group_name, additions_by_group_name, copied_target_group_names
+
+
+def _apply_seam_weight_update_plan(source_obj, removals_by_group_name, additions_by_group_name):
+    existing_groups_by_name = {group.name: group for group in source_obj.vertex_groups}
+    for group_name, vertex_indices in removals_by_group_name.items():
+        group = existing_groups_by_name.get(group_name)
+        if group is None or not vertex_indices:
+            continue
+        group.remove(tuple(vertex_indices))
+
+    groups_by_name = _ensure_vertex_groups(source_obj, additions_by_group_name)
+    written_weight_count = 0
+    for group_name, additions in additions_by_group_name.items():
+        group = groups_by_name[group_name]
+        for vertex_index, weight in additions:
+            group.add((vertex_index,), weight, "REPLACE")
+            written_weight_count += 1
+    return written_weight_count
+
+
+def unify_seam_vertex_weights(
+    source_obj,
+    target_obj,
+    source_seam_vertices=None,
+    target_seam_vertices=None,
+    match_tolerance=DEFAULT_MATCH_TOLERANCE,
+):
+    """Copy matched target seam vertex weights onto source seam vertices."""
+    if not is_mesh_object(source_obj) or not is_mesh_object(target_obj):
+        raise ValueError("Choose valid mesh objects.")
+    if source_obj == target_obj:
+        raise ValueError("Source and target objects must be different.")
+    if match_tolerance <= 0.0:
+        raise ValueError("Match tolerance must be greater than zero.")
+
+    if source_seam_vertices is None:
+        source_seam_vertices = collect_seam_vertices(source_obj)
+    if target_seam_vertices is None:
+        target_seam_vertices = collect_seam_vertices(target_obj)
+
+    if not source_seam_vertices:
+        raise ValueError(f"{source_obj.name} has no open-boundary seam vertices.")
+    if not target_seam_vertices:
+        raise ValueError(f"{target_obj.name} has no open-boundary seam vertices.")
+
+    matched_pairs, unmatched_source, unmatched_target = build_vertex_pairs(
+        source_seam_vertices,
+        target_seam_vertices,
+        match_tolerance,
+    )
+    if not matched_pairs:
+        raise ValueError(f"{source_obj.name} has no seam vertices matching {target_obj.name}.")
+
+    removals_by_group_name, additions_by_group_name, copied_target_group_names = _build_seam_weight_update_plan(
+        source_obj,
+        target_obj,
+        matched_pairs,
+    )
+    written_weight_count = _apply_seam_weight_update_plan(
+        source_obj,
+        removals_by_group_name,
+        additions_by_group_name,
+    )
+
+    return {
+        "matched_pair_count": len(matched_pairs),
+        "unmatched_source_count": len(unmatched_source),
+        "unmatched_target_count": len(unmatched_target),
+        "touched_source_vertex_count": len(matched_pairs),
+        "written_weight_count": written_weight_count,
+        "copied_group_count": len(copied_target_group_names),
+    }
+
+
 def _sorted_weight_items(weight_map):
     filtered_items = [
         (group_name, weight)

@@ -2,12 +2,106 @@
 
 from __future__ import annotations
 
+from array import array
 import re
 
-from .common import sync_edit_mesh_data
+from mathutils import Vector
+from mathutils.kdtree import KDTree
+
+from .common import get_flat_point_coordinates, is_armature_object, sync_edit_mesh_data
 
 
 _WEIGHT_EPSILON = 1.0e-8
+
+_BIP001_BODY_EXACT_PARTS = {
+    "pelvis",
+    "spine",
+    "spine1",
+    "spine2",
+    "neck",
+    "head",
+    "l-clavicle",
+    "r-clavicle",
+    "l-upperarm",
+    "r-upperarm",
+    "l-forearm",
+    "r-forearm",
+    "l-hand",
+    "r-hand",
+    "l-thigh",
+    "r-thigh",
+    "l-calf",
+    "r-calf",
+    "l-foot",
+    "r-foot",
+}
+_BIP001_BODY_PREFIX_PARTS = (
+    "l-finger",
+    "r-finger",
+    "l-toe",
+    "r-toe",
+)
+_BODY_TWIST_PART_TOKENS = (
+    "upperarm",
+    "forearm",
+    "thigh",
+    "calf",
+)
+_BODY_BN_TOKENS = (
+    "handd",
+    "handu",
+    "elbowavg",
+    "elbowpush",
+    "kneeavg",
+    "kneepush",
+    "xiong",
+)
+_NON_BODY_GROUP_TOKENS = (
+    "cloth",
+    "qun",
+    "skirt",
+    "dress",
+    "tail",
+    "piaodai",
+    "lalian",
+    "gongpai",
+    "tie",
+    "callor",
+    "collar",
+    "hair",
+    "weapon",
+    "prop",
+    "socket",
+    "fx",
+)
+_SIDE_NAME_REPLACEMENTS = (
+    ("-L-", "-R-"),
+    ("-R-", "-L-"),
+    ("-l-", "-r-"),
+    ("-r-", "-l-"),
+    ("_L_", "_R_"),
+    ("_R_", "_L_"),
+    ("_l_", "_r_"),
+    ("_r_", "_l_"),
+)
+_SIDE_NAME_SUFFIX_REPLACEMENTS = (
+    ("_L", "_R"),
+    ("_R", "_L"),
+    ("_l", "_r"),
+    ("_r", "_l"),
+    (".L", ".R"),
+    (".R", ".L"),
+    (".l", ".r"),
+    (".r", ".l"),
+    ("-L", "-R"),
+    ("-R", "-L"),
+    ("-l", "-r"),
+    ("-r", "-l"),
+)
+_LEFT_SIDE_TOKENS = ("-L-", "-l-", "_L_", "_l_")
+_RIGHT_SIDE_TOKENS = ("-R-", "-r-", "_R_", "_r_")
+_LEFT_SIDE_SUFFIXES = ("_L", "_l", ".L", ".l", "-L", "-l")
+_RIGHT_SIDE_SUFFIXES = ("_R", "_r", ".R", ".r", "-R", "-r")
 
 
 def has_rename_rule(settings):
@@ -232,6 +326,118 @@ def remove_empty_vertex_groups(obj):
     return removed_count
 
 
+def _build_mesh_adjacency(mesh):
+    adjacency = [[] for _vertex in mesh.vertices]
+    if not mesh.edges:
+        return adjacency
+
+    edge_vertices = array("i", [0]) * (len(mesh.edges) * 2)
+    mesh.edges.foreach_get("vertices", edge_vertices)
+    for edge_index in range(0, len(edge_vertices), 2):
+        vertex_a = edge_vertices[edge_index]
+        vertex_b = edge_vertices[edge_index + 1]
+        if vertex_a == vertex_b:
+            continue
+        adjacency[vertex_a].append(vertex_b)
+        adjacency[vertex_b].append(vertex_a)
+    return adjacency
+
+
+def _collect_vertex_group_weight_entries(obj):
+    entries_by_group_index = [[] for _group in obj.vertex_groups]
+    group_count = len(entries_by_group_index)
+    for vertex in obj.data.vertices:
+        vertex_index = vertex.index
+        for assignment in vertex.groups:
+            if assignment.weight <= _WEIGHT_EPSILON:
+                continue
+            if assignment.group < 0 or assignment.group >= group_count:
+                continue
+            entries_by_group_index[assignment.group].append((vertex_index, float(assignment.weight)))
+    return entries_by_group_index
+
+
+def _weighted_components(weight_by_vertex_index, adjacency):
+    unvisited = set(weight_by_vertex_index)
+    components = []
+
+    while unvisited:
+        start_vertex = unvisited.pop()
+        stack = [start_vertex]
+        component_vertices = [start_vertex]
+        component_weight = weight_by_vertex_index[start_vertex]
+
+        while stack:
+            vertex_index = stack.pop()
+            for neighbor_index in adjacency[vertex_index]:
+                if neighbor_index not in unvisited:
+                    continue
+                unvisited.remove(neighbor_index)
+                stack.append(neighbor_index)
+                component_vertices.append(neighbor_index)
+                component_weight += weight_by_vertex_index[neighbor_index]
+
+        components.append((component_weight, len(component_vertices), component_vertices))
+
+    return components
+
+
+def clean_disconnected_vertex_group_weights(obj):
+    """Keep only the largest connected weight island in each vertex group."""
+    if obj is None:
+        raise ValueError("Choose a valid mesh object.")
+    if not getattr(obj, "vertex_groups", None):
+        raise ValueError("The active mesh has no vertex groups.")
+
+    sync_edit_mesh_data(obj)
+    adjacency = _build_mesh_adjacency(obj.data)
+    entries_by_group_index = _collect_vertex_group_weight_entries(obj)
+
+    processed_group_count = 0
+    cleaned_group_count = 0
+    removed_weight_count = 0
+    removed_component_count = 0
+
+    for group in obj.vertex_groups:
+        entries = entries_by_group_index[group.index]
+        if len(entries) <= 1:
+            continue
+
+        processed_group_count += 1
+        weight_by_vertex_index = dict(entries)
+        components = _weighted_components(weight_by_vertex_index, adjacency)
+        if len(components) <= 1:
+            continue
+
+        keep_index = max(
+            range(len(components)),
+            key=lambda component_index: (
+                components[component_index][0],
+                components[component_index][1],
+            ),
+        )
+        remove_vertex_indices = []
+        for component_index, _component in enumerate(components):
+            if component_index == keep_index:
+                continue
+            remove_vertex_indices.extend(components[component_index][2])
+
+        if not remove_vertex_indices:
+            continue
+
+        group.remove(remove_vertex_indices)
+        cleaned_group_count += 1
+        removed_weight_count += len(remove_vertex_indices)
+        removed_component_count += len(components) - 1
+
+    return {
+        "processed_group_count": processed_group_count,
+        "cleaned_group_count": cleaned_group_count,
+        "removed_weight_count": removed_weight_count,
+        "removed_component_count": removed_component_count,
+    }
+
+
 def _resolve_deforming_bone_names(obj):
     bone_names = set()
     for modifier in getattr(obj, "modifiers", []):
@@ -290,6 +496,405 @@ def remove_non_deforming_vertex_groups(obj):
         "removed_count": removed_count,
         "removed_helper_count": removed_helper_count,
         "removed_empty_deform_count": removed_empty_deform_count,
+    }
+
+
+def _is_bip001_body_group(normalized_name):
+    if not normalized_name.startswith("bip001-"):
+        return False
+
+    part_name = normalized_name[len("bip001-") :]
+    return part_name in _BIP001_BODY_EXACT_PARTS or part_name.startswith(_BIP001_BODY_PREFIX_PARTS)
+
+
+def _is_body_twist_group(normalized_name):
+    if not normalized_name.startswith("bone-") or "twist" not in normalized_name:
+        return False
+    return any(token in normalized_name for token in _BODY_TWIST_PART_TOKENS)
+
+
+def _is_body_bn_group(normalized_name):
+    if not normalized_name.startswith("bn_"):
+        return False
+    compact_name = normalized_name.replace("_", "")
+    return any(token in compact_name for token in _BODY_BN_TOKENS)
+
+
+def is_body_vertex_group_name(name):
+    """Return True when a game-style vertex group belongs to the body skeleton."""
+    normalized_name = name.strip().lower()
+    if not normalized_name:
+        return False
+    if any(token in normalized_name for token in _NON_BODY_GROUP_TOKENS):
+        return False
+    return (
+        _is_bip001_body_group(normalized_name)
+        or _is_body_twist_group(normalized_name)
+        or _is_body_bn_group(normalized_name)
+    )
+
+
+def _find_best_group_armature(group_names, armature_objects):
+    best_armature = None
+    best_match_count = 0
+
+    for armature_obj in armature_objects or ():
+        if not is_armature_object(armature_obj):
+            continue
+
+        bone_names = {bone.name for bone in getattr(armature_obj.data, "bones", [])}
+        match_count = len(group_names & bone_names)
+        if match_count > best_match_count:
+            best_armature = armature_obj
+            best_match_count = match_count
+
+    return best_armature, best_match_count
+
+
+def _find_body_parent_name(bone, keep_names):
+    parent = getattr(bone, "parent", None)
+    while parent is not None:
+        if parent.name in keep_names:
+            return parent.name
+        parent = getattr(parent, "parent", None)
+    return None
+
+
+def _build_non_body_parent_map(groups, keep_names, armature_obj):
+    if armature_obj is None:
+        return {}
+
+    bone_by_name = {bone.name: bone for bone in getattr(armature_obj.data, "bones", [])}
+    parent_map = {}
+    for group in groups:
+        if group.name in keep_names:
+            continue
+
+        bone = bone_by_name.get(group.name)
+        if bone is None:
+            continue
+
+        parent_name = _find_body_parent_name(bone, keep_names)
+        if parent_name is not None:
+            parent_map[group.name] = parent_name
+
+    return parent_map
+
+
+def _fold_vertex_group_weights_to_parents(obj, parent_map):
+    if not parent_map:
+        return {
+            "folded_group_count": 0,
+            "folded_weight_count": 0,
+            "weighted_group_indices": _collect_weighted_group_indices(obj),
+        }
+
+    group_by_name = {group.name: group for group in obj.vertex_groups}
+    source_index_to_target_group = {}
+    for source_name, target_name in parent_map.items():
+        source_group = group_by_name.get(source_name)
+        target_group = group_by_name.get(target_name)
+        if source_group is None or target_group is None:
+            continue
+        source_index_to_target_group[source_group.index] = target_group
+
+    weighted_group_indices = set()
+    folded_weight_count = 0
+    for vertex in getattr(obj.data, "vertices", []):
+        additions_by_target = {}
+        for assignment in list(vertex.groups):
+            if assignment.weight <= _WEIGHT_EPSILON:
+                continue
+
+            weighted_group_indices.add(assignment.group)
+            target_group = source_index_to_target_group.get(assignment.group)
+            if target_group is None:
+                continue
+
+            additions_by_target[target_group] = additions_by_target.get(target_group, 0.0) + assignment.weight
+            folded_weight_count += 1
+
+        for target_group, weight in additions_by_target.items():
+            target_group.add((vertex.index,), weight, "ADD")
+
+    return {
+        "folded_group_count": len(source_index_to_target_group),
+        "folded_weight_count": folded_weight_count,
+        "weighted_group_indices": weighted_group_indices,
+    }
+
+
+def remove_non_body_vertex_groups(obj, armature_objects=None):
+    """Fold non-body weights to parent body bones, then remove the folded groups."""
+    if obj is None:
+        raise ValueError("Choose a valid mesh object.")
+
+    sync_edit_mesh_data(obj)
+
+    groups = list(obj.vertex_groups)
+    group_names = {group.name for group in groups}
+    keep_names = {group.name for group in groups if is_body_vertex_group_name(group.name)}
+    if not keep_names:
+        raise ValueError("The active mesh has no recognized body vertex groups.")
+
+    armature_obj, armature_match_count = _find_best_group_armature(group_names, armature_objects)
+    parent_map = _build_non_body_parent_map(groups, keep_names, armature_obj)
+    fold_result = _fold_vertex_group_weights_to_parents(obj, parent_map)
+    weighted_group_indices = fold_result["weighted_group_indices"]
+
+    kept_count = 0
+    removed_count = 0
+    skipped_unmapped_count = 0
+    skipped_weighted_unmapped_count = 0
+    for group in reversed(list(obj.vertex_groups)):
+        if group.name in keep_names:
+            kept_count += 1
+            continue
+        if group.name not in parent_map and group.index in weighted_group_indices:
+            skipped_unmapped_count += 1
+            skipped_weighted_unmapped_count += 1
+            continue
+        obj.vertex_groups.remove(group)
+        removed_count += 1
+
+    return {
+        "kept_count": kept_count,
+        "removed_count": removed_count,
+        "folded_group_count": fold_result["folded_group_count"],
+        "folded_weight_count": fold_result["folded_weight_count"],
+        "skipped_unmapped_count": skipped_unmapped_count,
+        "skipped_weighted_unmapped_count": skipped_weighted_unmapped_count,
+        "armature_name": getattr(armature_obj, "name", ""),
+        "armature_match_count": armature_match_count,
+    }
+
+
+def mirror_vertex_group_side_name(name):
+    """Return the opposite-side vertex-group name candidate, or None for center names."""
+    for source_token, target_token in _SIDE_NAME_REPLACEMENTS:
+        if source_token in name:
+            return name.replace(source_token, target_token, 1)
+
+    for source_suffix, target_suffix in _SIDE_NAME_SUFFIX_REPLACEMENTS:
+        if name.endswith(source_suffix):
+            return f"{name[: -len(source_suffix)]}{target_suffix}"
+
+    return None
+
+
+def _vertex_group_side(name):
+    if any(token in name for token in _LEFT_SIDE_TOKENS) or name.endswith(_LEFT_SIDE_SUFFIXES):
+        return "LEFT"
+    if any(token in name for token in _RIGHT_SIDE_TOKENS) or name.endswith(_RIGHT_SIDE_SUFFIXES):
+        return "RIGHT"
+    return None
+
+
+def _build_mirror_group_pairs(obj):
+    group_names = {group.name for group in obj.vertex_groups}
+    group_pairs = []
+    seen_names = set()
+
+    for group in obj.vertex_groups:
+        if group.name in seen_names:
+            continue
+
+        mirrored_name = mirror_vertex_group_side_name(group.name)
+        if mirrored_name is None or mirrored_name not in group_names:
+            continue
+
+        seen_names.add(group.name)
+        seen_names.add(mirrored_name)
+        side = _vertex_group_side(group.name)
+        mirrored_side = _vertex_group_side(mirrored_name)
+        if side == "LEFT" and mirrored_side == "RIGHT":
+            group_pairs.append((group.name, mirrored_name))
+        elif side == "RIGHT" and mirrored_side == "LEFT":
+            group_pairs.append((mirrored_name, group.name))
+
+    return group_pairs
+
+
+def _read_sparse_group_weights(obj, group_name):
+    vertex_group = obj.vertex_groups.get(group_name)
+    if vertex_group is None:
+        return {}
+
+    weights_by_vertex_index = {}
+    group_index = vertex_group.index
+    for vertex in obj.data.vertices:
+        for assignment in vertex.groups:
+            if assignment.group == group_index and assignment.weight > _WEIGHT_EPSILON:
+                weights_by_vertex_index[vertex.index] = float(assignment.weight)
+                break
+    return weights_by_vertex_index
+
+
+def _clear_group_weights(obj, group_names):
+    group_indices = {
+        group.index: group
+        for group in obj.vertex_groups
+        if group.name in group_names
+    }
+    if not group_indices:
+        return 0
+
+    vertices_by_group_index = {group_index: [] for group_index in group_indices}
+    for vertex in obj.data.vertices:
+        for assignment in vertex.groups:
+            if assignment.group in vertices_by_group_index:
+                vertices_by_group_index[assignment.group].append(vertex.index)
+
+    cleared_count = 0
+    for group_index, vertex_indices in vertices_by_group_index.items():
+        if not vertex_indices:
+            continue
+        group_indices[group_index].remove(vertex_indices)
+        cleared_count += len(vertex_indices)
+    return cleared_count
+
+
+def _write_sparse_group_weights(obj, group_name, weights_by_vertex_index):
+    vertex_group = obj.vertex_groups.get(group_name)
+    if vertex_group is None:
+        return 0
+
+    written_count = 0
+    for vertex_index, weight in weights_by_vertex_index.items():
+        vertex_group.add((vertex_index,), min(1.0, weight), "REPLACE")
+        written_count += 1
+    return written_count
+
+
+def _custom_mirror_tolerance(flat_coordinates):
+    if not flat_coordinates:
+        return 1.0e-5
+
+    min_x = max_x = flat_coordinates[0]
+    min_y = max_y = flat_coordinates[1]
+    min_z = max_z = flat_coordinates[2]
+    for coordinate_index in range(3, len(flat_coordinates), 3):
+        x = flat_coordinates[coordinate_index]
+        y = flat_coordinates[coordinate_index + 1]
+        z = flat_coordinates[coordinate_index + 2]
+        min_x = min(min_x, x)
+        max_x = max(max_x, x)
+        min_y = min(min_y, y)
+        max_y = max(max_y, y)
+        min_z = min(min_z, z)
+        max_z = max(max_z, z)
+
+    diagonal = Vector((max_x - min_x, max_y - min_y, max_z - min_z)).length
+    return max(1.0e-5, diagonal * 0.0005)
+
+
+def _build_vertex_kdtree(flat_coordinates, vertex_count):
+    kd_tree = KDTree(vertex_count)
+    for vertex_index in range(vertex_count):
+        coordinate_index = vertex_index * 3
+        kd_tree.insert(
+            Vector(
+                (
+                    flat_coordinates[coordinate_index],
+                    flat_coordinates[coordinate_index + 1],
+                    flat_coordinates[coordinate_index + 2],
+                )
+            ),
+            vertex_index,
+        )
+    kd_tree.balance()
+    return kd_tree
+
+
+def _custom_mirror_weights(obj, source_to_target, tolerance=0.0):
+    flat_coordinates = get_flat_point_coordinates(obj.data.vertices)
+    vertex_count = len(obj.data.vertices)
+    if tolerance <= 0.0:
+        tolerance = _custom_mirror_tolerance(flat_coordinates)
+
+    kd_tree = _build_vertex_kdtree(flat_coordinates, vertex_count)
+    group_by_name = {group.name: group for group in obj.vertex_groups}
+    source_index_to_target_name = {
+        group_by_name[source_name].index: target_name
+        for source_name, target_name in source_to_target.items()
+        if source_name in group_by_name and target_name in group_by_name
+    }
+    weights_by_target_name = {target_name: {} for target_name in source_to_target.values()}
+    mirrored_vertex_by_source = {}
+    unmatched_vertex_count = 0
+
+    for vertex in obj.data.vertices:
+        source_assignments = [
+            assignment
+            for assignment in vertex.groups
+            if assignment.group in source_index_to_target_name and assignment.weight > _WEIGHT_EPSILON
+        ]
+        if not source_assignments:
+            continue
+
+        coordinate_index = vertex.index * 3
+        mirrored_coordinate = Vector(
+            (
+                -flat_coordinates[coordinate_index],
+                flat_coordinates[coordinate_index + 1],
+                flat_coordinates[coordinate_index + 2],
+            )
+        )
+        _found_coordinate, target_vertex_index, distance = kd_tree.find(mirrored_coordinate)
+        if target_vertex_index is None or distance > tolerance:
+            unmatched_vertex_count += 1
+            continue
+
+        mirrored_vertex_by_source[vertex.index] = target_vertex_index
+        for assignment in source_assignments:
+            target_name = source_index_to_target_name[assignment.group]
+            target_weights = weights_by_target_name[target_name]
+            target_weights[target_vertex_index] = min(
+                1.0,
+                target_weights.get(target_vertex_index, 0.0) + float(assignment.weight),
+            )
+
+    cleared_weight_count = _clear_group_weights(obj, set(weights_by_target_name))
+    written_weight_count = 0
+    for target_name, weights_by_vertex_index in weights_by_target_name.items():
+        written_weight_count += _write_sparse_group_weights(obj, target_name, weights_by_vertex_index)
+
+    return {
+        "cleared_weight_count": cleared_weight_count,
+        "written_weight_count": written_weight_count,
+        "unmatched_vertex_count": unmatched_vertex_count,
+        "paired_vertex_count": len(mirrored_vertex_by_source),
+        "tolerance": tolerance,
+    }
+
+
+def mirror_vertex_group_weights_x(
+    obj,
+    direction="LEFT_TO_RIGHT",
+    tolerance=0.0,
+):
+    """Mirror recognized left/right vertex-group pairs without renaming groups."""
+    if obj is None:
+        raise ValueError("Choose a valid mesh object.")
+    if direction not in {"LEFT_TO_RIGHT", "RIGHT_TO_LEFT"}:
+        raise ValueError("Choose a valid mirror direction.")
+
+    sync_edit_mesh_data(obj)
+    group_pairs = _build_mirror_group_pairs(obj)
+    if not group_pairs:
+        raise ValueError("No left/right vertex-group pairs were found.")
+
+    source_to_target = {
+        left_name if direction == "LEFT_TO_RIGHT" else right_name:
+        right_name if direction == "LEFT_TO_RIGHT" else left_name
+        for left_name, right_name in group_pairs
+    }
+
+    result = _custom_mirror_weights(obj, source_to_target, tolerance=tolerance)
+    return {
+        "pair_count": len(group_pairs),
+        "mirrored_group_count": len(source_to_target),
+        **result,
     }
 
 

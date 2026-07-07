@@ -4,20 +4,19 @@ import bpy
 
 from ..core.armature_cleanup import (
     clean_fk_armature,
-    get_cleanup_mesh_objects,
     resolve_cleanup_armature,
 )
 from ..core.common import ensure_object_mode, restore_context_mode
 
 
 class MDT_OT_clean_fk_armature(bpy.types.Operator):
-    """Convert an armature into a simple weighted FK rig."""
+    """Remove pose rigging helpers and keep the current pose as FK controls."""
 
     bl_idname = "mdt.clean_fk_armature"
     bl_label = "Clean To FK"
     bl_description = (
-        "Bake visible mesh modifiers, apply the current armature pose as rest pose, "
-        "remove unweighted/control bones, and rebind Armature modifiers"
+        "Remove pose constraints and locks, preserve every bone and parent link, "
+        "and keep the current visible pose as editable FK transforms"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -31,7 +30,6 @@ class MDT_OT_clean_fk_armature(bpy.types.Operator):
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
 
-        mesh_objects = get_cleanup_mesh_objects(context, armature_obj)
         try:
             previous_mode = ensure_object_mode(context)
         except RuntimeError as exc:
@@ -39,7 +37,7 @@ class MDT_OT_clean_fk_armature(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            result = clean_fk_armature(context, armature_obj, mesh_objects)
+            result = clean_fk_armature(context, armature_obj)
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -49,13 +47,10 @@ class MDT_OT_clean_fk_armature(bpy.types.Operator):
         self.report(
             {"INFO"},
             (
-                f"Cleaned {armature_obj.name}: applied {result['applied_modifier_count']} modifier(s) "
-                f"on {result['mesh_count']} mesh object(s), preserved {result['shape_key_count']} "
-                f"shape key(s), kept {result['kept_bone_count']} / {result['original_bone_count']} "
-                f"bone(s), removed {result['removed_bone_count']} bone(s), stripped "
-                f"{result['constraint_count']} constraint(s), cleared {result['transform_count']} "
-                f"pose transform(s) and {result['lock_count']} lock(s), rebound "
-                f"{result['restored_modifier_count']} Armature modifier(s)."
+                f"Cleaned {armature_obj.name}: preserved {result['bone_count']} bone(s) "
+                f"and hierarchy, removed {result['constraint_count']} pose constraint(s), "
+                f"cleared {result['lock_count']} lock(s), restored current pose on "
+                f"{result['restored_pose_count']} FK bone(s)."
             ),
         )
         return {"FINISHED"}

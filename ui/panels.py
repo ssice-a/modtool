@@ -59,12 +59,36 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
                 text="Remove Empty",
                 icon="TRASH",
             )
+            cleanup_row.operator(
+                "mdt.clean_disconnected_vertex_group_weights",
+                text="Clean Islands",
+                icon="BRUSH_DATA",
+            )
             keep_row = layout.row()
             keep_row.operator(
                 "mdt.keep_deforming_vertex_groups",
                 text="Keep Bone Groups",
                 icon="ARMATURE_DATA",
             )
+            body_row = layout.row()
+            body_row.operator(
+                "mdt.keep_body_vertex_groups",
+                text="Keep Body Groups",
+                icon="GROUP_VERTEX",
+            )
+            mirror_row = layout.row(align=True)
+            left_to_right = mirror_row.operator(
+                "mdt.mirror_vertex_group_weights",
+                text="L -> R",
+                icon="MOD_MIRROR",
+            )
+            left_to_right.direction = "LEFT_TO_RIGHT"
+            right_to_left = mirror_row.operator(
+                "mdt.mirror_vertex_group_weights",
+                text="R -> L",
+                icon="MOD_MIRROR",
+            )
+            right_to_left.direction = "RIGHT_TO_LEFT"
         else:
             layout.label(text="Rule rename uses the active mesh object's vertex groups.", icon="INFO")
 
@@ -87,6 +111,14 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
             and source_obj != target_obj
         )
         rename_row.operator("mdt.rename_groups_from_target", icon="CHECKMARK")
+
+        seam_weight_row = mapping_box.row()
+        seam_weight_row.enabled = (
+            source_obj is not None
+            and target_obj is not None
+            and source_obj != target_obj
+        )
+        seam_weight_row.operator("mdt.unify_seam_weights_from_target", icon="MOD_VERTEX_WEIGHT")
 
         mapping_box.label(text="Select Source and Target, then rename.", icon="INFO")
 
@@ -126,11 +158,18 @@ class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
         )
         action_row.operator("mdt.transfer_shape_keys", icon="MOD_MESHDEFORM")
 
-        delete_row = layout.row()
-        delete_row.operator(
-            "mdt.delete_selected_geometry_keep_shape_keys",
-            text="Delete Selection Keep Shape Keys",
-            icon="TRASH",
+        range_box = layout.box()
+        range_box.label(text="Shape Key Ranges", icon="SHAPEKEY_DATA")
+        range_row = range_box.row(align=True)
+        range_row.operator(
+            "mdt.set_shape_key_current_values_as_zero",
+            text="Current Values as Zero",
+            icon="CHECKMARK",
+        )
+        range_row.operator(
+            "mdt.normalize_shape_key_ranges",
+            text="Normalize 0-1",
+            icon="CHECKMARK",
         )
 
         action_row = layout.row()
@@ -170,6 +209,10 @@ class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
 
+        mirror_settings = context.scene.mdt_pose_mirror_settings
+        mirror_box = layout.box()
+        mirror_box.prop(mirror_settings, "enabled", toggle=True)
+
         merge_settings = context.scene.mdt_bone_merge_settings
         source_obj, target_obj = resolve_bone_merge_armatures(context, merge_settings)
         captured_bone_count = len(parse_bone_names(merge_settings.captured_bone_names))
@@ -190,8 +233,8 @@ class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):
 
         box = layout.box()
         box.label(text="FK Cleanup", icon="ARMATURE_DATA")
-        box.label(text="Bakes visible mesh modifiers before cleaning.", icon="INFO")
-        box.label(text="Applies current pose as rest, then rebinds Armature modifiers.", icon="INFO")
+        box.label(text="Removes pose constraints and transform locks.", icon="INFO")
+        box.label(text="Keeps all bones, hierarchy, and the current visible pose.", icon="INFO")
 
         action_row = box.row()
         action_row.operator("mdt.clean_fk_armature", icon="ARMATURE_DATA")

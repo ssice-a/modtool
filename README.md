@@ -12,7 +12,7 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 - One-click seam vertex-group renaming from the active mesh to the selected meshes
 - One-click material creation from object names
 - Split selected meshes by material and rename the pieces automatically
-- Armature FK cleanup that keeps weighted bones, removes control bones, strips pose constraints, and unlocks pose transforms
+- Armature FK cleanup that preserves the skeleton hierarchy while stripping pose constraints and locks
 
 ## Usage
 
@@ -29,7 +29,7 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 - `Materials`
   Create one material per selected object or split selected objects by their material slots.
 - `Armature`
-  Convert a rig to a direct FK skeleton by keeping bones with weighted matching vertex groups, removing unweighted bones, clearing pose constraints, and unlocking pose transforms.
+  Convert a constrained pose rig to direct FK controls by clearing pose constraints and locks while preserving every bone and parent relationship.
 
 ## Code Layout
 
