@@ -564,13 +564,13 @@ def _assign_mapping_rows(
         claimed_targets[target_group].append(source_group)
 
     remaining_sources = [source_group for source_group in source_order if source_group not in assigned_rows]
-    remaining_sources.sort(
-        key=lambda source_group: (
-            candidates_by_source.get(source_group, [{}])[0].get("confidence", 0.0),
-            candidates_by_source.get(source_group, [{}])[0].get("score_overlap", 0.0),
-        ),
-        reverse=True,
-    )
+    def candidate_sort_key(source_group):
+        candidates = candidates_by_source.get(source_group) or ()
+        if not candidates:
+            return (0.0, 0.0)
+        return (candidates[0]["confidence"], candidates[0]["score_overlap"])
+
+    remaining_sources.sort(key=candidate_sort_key, reverse=True)
 
     for source_group in remaining_sources:
         candidates = candidates_by_source.get(source_group, [])

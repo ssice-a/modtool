@@ -10,7 +10,7 @@ from ..core.group_mapping import (
     resolve_group_mapping_objects,
     store_group_match_rows,
 )
-from ..core.seam import unify_seam_vertex_weights
+from ..core.seam import unify_selected_loop_weights
 
 
 class MDT_OT_rename_groups_from_target(bpy.types.Operator):
@@ -79,61 +79,39 @@ class MDT_OT_rename_groups_from_target(bpy.types.Operator):
 
 
 class MDT_OT_unify_seam_weights_from_target(bpy.types.Operator):
-    """Copy matched target seam vertex weights onto source seam vertices."""
+    """Unify the non-active selected loop to the active loop's weights."""
 
     bl_idname = "mdt.unify_seam_weights_from_target"
     bl_label = "Unify Seam Weights"
-    bl_description = "Copy target weights to matching source seam vertices using nearby open-boundary vertices"
+    bl_description = "Copy the active loop's weights onto the other selected loop, interpolating between reference vertices"
     bl_options = {"REGISTER", "UNDO"}
 
     match_tolerance: bpy.props.FloatProperty(
-        name="Match Tolerance",
-        description="Maximum world-space distance for matching source and target seam vertices",
+        name="Coincidence Tolerance",
+        description="World-space distance for direct vertex copying; other vertices interpolate along the reference loop",
         default=0.0001,
         min=0.0,
-        soft_min=0.000001,
         soft_max=0.01,
         precision=6,
     )
 
     @classmethod
-    def poll(cls, _context):
-        return True
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH"
 
     def execute(self, context):
-        source_obj, target_obj = resolve_group_mapping_objects(context.scene.mdt_group_match_settings)
-        if source_obj is None or target_obj is None:
-            self.report({"ERROR"}, "Choose valid Source and Target mesh objects.")
-            return {"CANCELLED"}
-
         try:
-            previous_mode = ensure_object_mode(context)
-        except RuntimeError as exc:
-            self.report({"ERROR"}, f"Could not switch to Object Mode: {exc}")
-            return {"CANCELLED"}
-
-        try:
-            result = unify_seam_vertex_weights(
-                source_obj,
-                target_obj,
-                match_tolerance=self.match_tolerance,
-            )
-        except ValueError as exc:
+            result = unify_selected_loop_weights(context, match_tolerance=self.match_tolerance)
+        except (ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        finally:
-            restore_context_mode(previous_mode)
-
-        if result["written_weight_count"] == 0:
-            self.report({"WARNING"}, "Matched seam vertices had no target weights to copy.")
             return {"CANCELLED"}
 
         message = (
-            f"Unified {result['touched_source_vertex_count']} source seam vertex/vertices from "
-            f"{target_obj.name}, wrote {result['written_weight_count']} weight(s) across "
-            f"{result['copied_group_count']} group(s)."
+            f"Unified {result['touched_source_vertex_count']} vertices: "
+            f"{result['copied_vertex_count']} copied, "
+            f"{result['interpolated_vertex_count']} interpolated."
         )
-        if result["unmatched_source_count"] > 0:
-            message += f" Unmatched source vertices: {result['unmatched_source_count']}."
-        self.report({"INFO"}, message)
+        if result["empty_vertex_count"]:
+            message += f" {result['empty_vertex_count']} vertices sampled unweighted reference segments."
+        self.report({"WARNING"} if result["empty_vertex_count"] else {"INFO"}, message)
         return {"FINISHED"}

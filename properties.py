@@ -19,6 +19,27 @@ def _pose_mirror_enabled_update(_self, _context):
     clear_pose_mirror_state()
 
 
+def _rig_mapping_items(self, context):
+    from .core.rig_group_rename import rig_mapping_items
+
+    return rig_mapping_items(self, context)
+
+
+class MDT_PG_AnimationSettings(bpy.types.PropertyGroup):
+    """File and destination for standard MMD body retargeting."""
+
+    target_armature: bpy.props.PointerProperty(
+        name="Target Rig", type=bpy.types.Object, poll=_armature_object_poll,
+    )
+    translation_multiplier: bpy.props.FloatProperty(
+        name="Translation Multiplier", description="Multiplier for motion translations after automatic leg-length scaling; 1 uses the Tda reference proportions",
+        default=1., min=.001, soft_max=2, precision=3,
+    )
+    start_frame: bpy.props.IntProperty(name="Start Frame", default=1, min=0)
+    last_action: bpy.props.StringProperty()
+    last_report: bpy.props.StringProperty()
+
+
 class MDT_PG_PoseMirrorSettings(bpy.types.PropertyGroup):
     """Settings for lightweight automatic pose mirroring."""
 
@@ -123,6 +144,58 @@ class MDT_PG_GroupMatchSettings(bpy.types.PropertyGroup):
         type=bpy.types.Object,
         poll=_mesh_object_poll,
     )
+
+    target_armature: bpy.props.PointerProperty(
+        name="Target Rig",
+        description="Armature whose actual bone names determine the rename targets",
+        type=bpy.types.Object,
+        poll=_armature_object_poll,
+    )
+
+    rig_mapping: bpy.props.EnumProperty(
+        name="Mapping",
+        description="Mapping preset used for the active mesh vertex groups",
+        items=_rig_mapping_items,
+    )
+
+
+class MDT_PG_BaseColorSPSettings(bpy.types.PropertyGroup):
+    """Settings for the reversible single-material Substance Painter workflow."""
+
+    grid_size: bpy.props.EnumProperty(
+        name="Grid",
+        description="Fixed atlas grid used for Base Color material preparation",
+        items=(
+            ("2", "2 x 2", "Place up to four materials in a 2 by 2 grid"),
+            ("3", "3 x 3", "Place up to nine materials in a 3 by 3 grid"),
+            ("4", "4 x 4", "Place up to sixteen materials in a 4 by 4 grid"),
+        ),
+        default="2",
+    )
+
+    directory: bpy.props.StringProperty(
+        name="Texture Directory",
+        description="Directory for the SP Base Color atlas and restored material textures",
+        subtype="DIR_PATH",
+        default="//",
+    )
+
+
+class MDT_PG_ColorBakeMaterial(bpy.types.PropertyGroup):
+    slot_index: bpy.props.IntProperty(default=0, min=0)
+    material: bpy.props.PointerProperty(type=bpy.types.Material)
+    target_uv: bpy.props.StringProperty(name="Destination UV")
+
+
+class MDT_PG_ColorBakeSettings(bpy.types.PropertyGroup):
+    mesh_object: bpy.props.PointerProperty(type=bpy.types.Object)
+    source_uv: bpy.props.StringProperty(name="Source UV", description="Captured active UV for texture nodes without an explicit UV map")
+    materials: bpy.props.CollectionProperty(type=MDT_PG_ColorBakeMaterial)
+    filepath: bpy.props.StringProperty(name="Output PNG", subtype="FILE_PATH", default="//OutputColor.png")
+    resolution: bpy.props.EnumProperty(name="Resolution", items=(("1024", "1K", "1024 pixels"), ("2048", "2K", "2048 pixels"), ("4096", "4K", "4096 pixels"), ("8192", "8K", "8192 pixels")), default="4096")
+    margin: bpy.props.IntProperty(name="Margin", description="Padding in pixels", default=8, min=0, max=64)
+    last_image: bpy.props.PointerProperty(type=bpy.types.Image)
+    last_uv: bpy.props.StringProperty()
 
 
 class MDT_PG_GroupMatchResultItem(bpy.types.PropertyGroup):
@@ -288,21 +361,60 @@ class MDT_PG_BoneMergeSettings(bpy.types.PropertyGroup):
     )
 
 
+class MDT_PG_JointSculptSelection(bpy.types.PropertyGroup):
+    object: bpy.props.PointerProperty(type=bpy.types.Object)
+
+
+class MDT_PG_JointSculptSource(bpy.types.PropertyGroup):
+    object: bpy.props.PointerProperty(type=bpy.types.Object)
+    mesh: bpy.props.PointerProperty(type=bpy.types.Mesh)
+    mesh_users: bpy.props.IntProperty()
+    start: bpy.props.IntProperty()
+    count: bpy.props.IntProperty()
+    hidden: bpy.props.BoolProperty()
+    state_hash: bpy.props.StringProperty()
+
+
+class MDT_PG_JointSculptSettings(bpy.types.PropertyGroup):
+    proxy: bpy.props.PointerProperty(type=bpy.types.Object)
+    proxy_mesh: bpy.props.PointerProperty(type=bpy.types.Mesh)
+    sources: bpy.props.CollectionProperty(type=MDT_PG_JointSculptSource)
+    selection: bpy.props.CollectionProperty(type=MDT_PG_JointSculptSelection)
+    previous_active: bpy.props.PointerProperty(type=bpy.types.Object)
+    previous_mode: bpy.props.StringProperty()
+    view_layer_name: bpy.props.StringProperty()
+    topology_hash: bpy.props.StringProperty()
+    proxy_matrix: bpy.props.FloatVectorProperty(size=16)
+    brush: bpy.props.PointerProperty(type=bpy.types.Brush)
+    automasking_backup: bpy.props.StringProperty()
+
+
 REGISTERED_CLASSES = (
+    MDT_PG_AnimationSettings,
     MDT_PG_PoseMirrorSettings,
     MDT_PG_RenameSettings,
     MDT_PG_GroupMatchSettings,
+    MDT_PG_BaseColorSPSettings,
+    MDT_PG_ColorBakeMaterial,
+    MDT_PG_ColorBakeSettings,
     MDT_PG_GroupMatchResultItem,
     MDT_PG_ShapeKeyTransferSettings,
     MDT_PG_BoneMergeSettings,
+    MDT_PG_JointSculptSelection,
+    MDT_PG_JointSculptSource,
+    MDT_PG_JointSculptSettings,
 )
 
 
 def register_addon_properties():
     """Register addon PointerProperties and collections on Scene."""
+    bpy.types.Scene.mdt_animation_settings = bpy.props.PointerProperty(type=MDT_PG_AnimationSettings)
     bpy.types.Scene.mdt_pose_mirror_settings = bpy.props.PointerProperty(type=MDT_PG_PoseMirrorSettings)
     bpy.types.Scene.mdt_rename_settings = bpy.props.PointerProperty(type=MDT_PG_RenameSettings)
     bpy.types.Scene.mdt_group_match_settings = bpy.props.PointerProperty(type=MDT_PG_GroupMatchSettings)
+    bpy.types.Scene.mdt_base_color_sp_settings = bpy.props.PointerProperty(type=MDT_PG_BaseColorSPSettings)
+    bpy.types.Scene.mdt_color_bake_settings = bpy.props.PointerProperty(type=MDT_PG_ColorBakeSettings)
+    bpy.types.Scene.mdt_joint_sculpt_settings = bpy.props.PointerProperty(type=MDT_PG_JointSculptSettings)
     bpy.types.Scene.mdt_shape_key_settings = bpy.props.PointerProperty(type=MDT_PG_ShapeKeyTransferSettings)
     bpy.types.Scene.mdt_bone_merge_settings = bpy.props.PointerProperty(type=MDT_PG_BoneMergeSettings)
     bpy.types.Scene.mdt_group_match_results = bpy.props.CollectionProperty(type=MDT_PG_GroupMatchResultItem)
@@ -310,6 +422,12 @@ def register_addon_properties():
 
 def unregister_addon_properties():
     """Remove addon PointerProperties and collections from Scene."""
+    if hasattr(bpy.types.Scene, "mdt_animation_settings"):
+        del bpy.types.Scene.mdt_animation_settings
+    if hasattr(bpy.types.Scene, "mdt_joint_sculpt_settings"):
+        del bpy.types.Scene.mdt_joint_sculpt_settings
+    if hasattr(bpy.types.Scene, "mdt_color_bake_settings"):
+        del bpy.types.Scene.mdt_color_bake_settings
     if hasattr(bpy.types.Scene, "mdt_pose_mirror_settings"):
         del bpy.types.Scene.mdt_pose_mirror_settings
     if hasattr(bpy.types.Scene, "mdt_group_match_results"):
@@ -320,5 +438,7 @@ def unregister_addon_properties():
         del bpy.types.Scene.mdt_bone_merge_settings
     if hasattr(bpy.types.Scene, "mdt_group_match_settings"):
         del bpy.types.Scene.mdt_group_match_settings
+    if hasattr(bpy.types.Scene, "mdt_base_color_sp_settings"):
+        del bpy.types.Scene.mdt_base_color_sp_settings
     if hasattr(bpy.types.Scene, "mdt_rename_settings"):
         del bpy.types.Scene.mdt_rename_settings

@@ -1,10 +1,21 @@
-"""Seam-based vertex-group rename helpers for Mod Tool."""
+"""Seam vertex-group renaming and selected-loop weight transfer."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from math import floor
 
+import bmesh
+import numpy as np
+from mathutils.kdtree import KDTree
+
 from .common import is_mesh_object, sync_edit_mesh_data
+from .loop_selection import (
+    active_edge_for_component,
+    edit_mesh_objects,
+    order_edge_cycle,
+    selected_edge_components,
+)
 from .rename import apply_exact_name_pairs
 
 
@@ -126,110 +137,174 @@ def read_vertex_weights(obj, vertex_index, group_names_by_index=None):
     return weight_map
 
 
-def _ensure_vertex_groups(obj, group_names):
-    groups_by_name = {group.name: group for group in obj.vertex_groups}
-    for group_name in group_names:
-        if group_name not in groups_by_name:
-            groups_by_name[group_name] = obj.vertex_groups.new(name=group_name)
-    return groups_by_name
+@dataclass
+class _WeightLoop:
+    obj: object
+    bm: object
+    verts: list
+    active: bool
 
 
-def _build_seam_weight_update_plan(source_obj, target_obj, matched_pairs):
-    source_group_names_by_index = {group.index: group.name for group in source_obj.vertex_groups}
-    target_group_names_by_index = {group.index: group.name for group in target_obj.vertex_groups}
-    removals_by_group_name = {}
-    additions_by_group_name = {}
-    copied_target_group_names = set()
+def _selected_weight_loops(context):
+    if context.mode != "EDIT_MESH":
+        raise ValueError("Select two closed edge loops in Mesh Edit Mode.")
+    loops = []
+    active_obj = context.view_layer.objects.active
+    for obj in edit_mesh_objects(context):
+        bm = bmesh.from_edit_mesh(obj.data)
+        components = selected_edge_components(bm)
+        covered = set()
+        for component in components:
+            active_edge = active_edge_for_component(component, bm.select_history.active)
+            verts, _edges = order_edge_cycle(component, active_edge)
+            covered.update(verts)
+            loops.append(_WeightLoop(obj, bm, verts, obj == active_obj and active_edge is not None))
+        if any(vert.select and not vert.hide and vert not in covered for vert in bm.verts):
+            raise ValueError("Select only the two loops; remove isolated selected vertices.")
+    if len(loops) != 2:
+        raise ValueError("Select exactly two closed, separate edge loops.")
+    active = [loop for loop in loops if loop.active]
+    # Multi-object Edit Mode has one active object. Its sole selected loop
+    # identifies the reference even when loop selection left no history item.
+    if not active:
+        active = [loop for loop in loops if loop.obj == active_obj]
+    if len(active) != 1:
+        raise ValueError("Make a vertex or edge on the reference loop active.")
+    target = active[0]
+    source = next(loop for loop in loops if loop is not target)
+    return source, target
 
-    for source_index, target_index in matched_pairs:
-        source_vertex = source_obj.data.vertices[source_index]
-        for assignment in source_vertex.groups:
-            if assignment.weight <= _WEIGHT_EPSILON:
-                continue
-            group_name = source_group_names_by_index.get(assignment.group)
-            if group_name is None:
-                continue
-            removals_by_group_name.setdefault(group_name, []).append(source_index)
 
-        target_weights = read_vertex_weights(target_obj, target_index, target_group_names_by_index)
-        for group_name, weight in target_weights.items():
-            if weight <= _WEIGHT_EPSILON:
-                continue
-            additions_by_group_name.setdefault(group_name, []).append((source_index, min(1.0, float(weight))))
-            copied_target_group_names.add(group_name)
-
-    return removals_by_group_name, additions_by_group_name, copied_target_group_names
+def _loop_world_positions(loop):
+    coordinates = np.asarray([tuple(vert.co) for vert in loop.verts], dtype=np.float64)
+    matrix = np.asarray(loop.obj.matrix_world, dtype=np.float64)
+    return coordinates @ matrix[:3, :3].T + matrix[:3, 3]
 
 
-def _apply_seam_weight_update_plan(source_obj, removals_by_group_name, additions_by_group_name):
-    existing_groups_by_name = {group.name: group for group in source_obj.vertex_groups}
-    for group_name, vertex_indices in removals_by_group_name.items():
-        group = existing_groups_by_name.get(group_name)
-        if group is None or not vertex_indices:
+def _loop_weight_samples(source_positions, target_positions, tolerance):
+    """Return reference endpoint indices and interpolation factors per source point."""
+    if not np.isfinite(source_positions).all() or not np.isfinite(target_positions).all():
+        raise ValueError("The selected loops contain non-finite coordinates.")
+    # Center spatial queries to limit KDTree float precision loss in world space.
+    origin = target_positions[0].copy()
+    target = target_positions - origin
+    source = source_positions - origin
+    directions = np.roll(target, -1, axis=0) - target
+    lengths_squared = np.einsum("ij,ij->i", directions, directions)
+    midpoints = target + directions * 0.5
+    max_half_length = float(np.sqrt(lengths_squared.max()) * 0.5)
+
+    vertex_tree = KDTree(len(target))
+    edge_tree = KDTree(len(target))
+    for index, (position, midpoint) in enumerate(zip(target, midpoints)):
+        vertex_tree.insert(tuple(position), index)
+        edge_tree.insert(tuple(midpoint), index)
+    vertex_tree.balance()
+    edge_tree.balance()
+
+    samples = []
+    copied_count = 0
+    maximum_distance = 0.0
+    for point in source:
+        query = tuple(point)
+        _co, nearest, _distance = vertex_tree.find(query)
+        nearest_distance = float(np.linalg.norm(point - target[nearest]))
+        if nearest_distance <= tolerance:
+            samples.append((nearest, nearest, 0.0))
+            copied_count += 1
+            maximum_distance = max(maximum_distance, nearest_distance)
             continue
-        group.remove(tuple(vertex_indices))
 
-    groups_by_name = _ensure_vertex_groups(source_obj, additions_by_group_name)
-    written_weight_count = 0
-    for group_name, additions in additions_by_group_name.items():
-        group = groups_by_name[group_name]
-        for vertex_index, weight in additions:
-            group.add((vertex_index,), weight, "REPLACE")
-            written_weight_count += 1
-    return written_weight_count
+        # Any edge closer than the nearest vertex has its midpoint within
+        # nearest_distance + half its length. This bound includes long edges
+        # whose endpoints are not the two nearest vertices.
+        radius = nearest_distance + max_half_length
+        radius += 1.0e-6 * max(radius, float(np.linalg.norm(point)), 1.0)
+        candidates = sorted({item[1] for item in edge_tree.find_range(query, radius)})
+        if not candidates:
+            raise RuntimeError("Could not locate a reference loop segment.")
+        indices = np.asarray(candidates, dtype=np.int32)
+        offsets = point - target[indices]
+        denominators = lengths_squared[indices]
+        factors = np.divide(
+            np.einsum("ij,ij->i", offsets, directions[indices]),
+            denominators,
+            out=np.zeros(len(indices), dtype=np.float64),
+            where=denominators > 0.0,
+        )
+        np.clip(factors, 0.0, 1.0, out=factors)
+        residuals = offsets - factors[:, None] * directions[indices]
+        distances_squared = np.einsum("ij,ij->i", residuals, residuals)
+        best = int(np.argmin(distances_squared))
+        edge_index = int(indices[best])
+        samples.append((edge_index, (edge_index + 1) % len(target), float(factors[best])))
+        maximum_distance = max(maximum_distance, float(np.sqrt(distances_squared[best])))
+    return samples, copied_count, maximum_distance
 
 
-def unify_seam_vertex_weights(
-    source_obj,
-    target_obj,
-    source_seam_vertices=None,
-    target_seam_vertices=None,
-    match_tolerance=DEFAULT_MATCH_TOLERANCE,
-):
-    """Copy matched target seam vertex weights onto source seam vertices."""
-    if not is_mesh_object(source_obj) or not is_mesh_object(target_obj):
-        raise ValueError("Choose valid mesh objects.")
-    if source_obj == target_obj:
-        raise ValueError("Source and target objects must be different.")
-    if match_tolerance <= 0.0:
-        raise ValueError("Match tolerance must be greater than zero.")
+def _loop_named_weights(loop):
+    layer = loop.bm.verts.layers.deform.active
+    if layer is None:
+        return [{} for _vert in loop.verts]
+    names = {group.index: group.name for group in loop.obj.vertex_groups}
+    return [
+        {names[index]: float(weight) for index, weight in vert[layer].items()
+         if index in names and weight > 0.0}
+        for vert in loop.verts
+    ]
 
-    if source_seam_vertices is None:
-        source_seam_vertices = collect_seam_vertices(source_obj)
-    if target_seam_vertices is None:
-        target_seam_vertices = collect_seam_vertices(target_obj)
 
-    if not source_seam_vertices:
-        raise ValueError(f"{source_obj.name} has no open-boundary seam vertices.")
-    if not target_seam_vertices:
-        raise ValueError(f"{target_obj.name} has no open-boundary seam vertices.")
-
-    matched_pairs, unmatched_source, unmatched_target = build_vertex_pairs(
-        source_seam_vertices,
-        target_seam_vertices,
-        match_tolerance,
+def unify_selected_loop_weights(context, match_tolerance=DEFAULT_MATCH_TOLERANCE):
+    """Replace non-active loop weights with samples from the active reference loop."""
+    if not np.isfinite(match_tolerance) or match_tolerance < 0.0:
+        raise ValueError("Coincidence tolerance must be finite and non-negative.")
+    source, target = _selected_weight_loops(context)
+    samples, copied_count, maximum_distance = _loop_weight_samples(
+        _loop_world_positions(source), _loop_world_positions(target), match_tolerance,
     )
-    if not matched_pairs:
-        raise ValueError(f"{source_obj.name} has no seam vertices matching {target_obj.name}.")
+    reference_weights = _loop_named_weights(target)
+    if not any(reference_weights):
+        raise ValueError("The active reference loop has no vertex-group weights.")
 
-    removals_by_group_name, additions_by_group_name, copied_target_group_names = _build_seam_weight_update_plan(
-        source_obj,
-        target_obj,
-        matched_pairs,
-    )
-    written_weight_count = _apply_seam_weight_update_plan(
-        source_obj,
-        removals_by_group_name,
-        additions_by_group_name,
-    )
+    updates = []
+    for first, second, factor in samples:
+        if first == second:
+            weights = reference_weights[first].copy()
+        else:
+            weights = {
+                name: weight * (1.0 - factor)
+                for name, weight in reference_weights[first].items()
+            }
+            for name, weight in reference_weights[second].items():
+                weights[name] = weights.get(name, 0.0) + weight * factor
+            weights = {name: weight for name, weight in weights.items() if weight > 0.0}
+        updates.append(weights)
 
+    # Adding the first deform layer can reallocate BMesh vertices. Retain
+    # indices and reacquire them after group/layer creation, not RNA handles.
+    source.bm.verts.index_update()
+    vertex_indices = [vert.index for vert in source.verts]
+    group_indices = {group.name: group.index for group in source.obj.vertex_groups}
+    required_names = {name for weights in updates for name in weights}
+    for name in sorted(required_names - group_indices.keys()):
+        group_indices[name] = source.obj.vertex_groups.new(name=name).index
+    bm = bmesh.from_edit_mesh(source.obj.data)
+    layer = bm.verts.layers.deform.verify()
+    bm.verts.ensure_lookup_table()
+    for index, weights in zip(vertex_indices, updates):
+        deform = bm.verts[index][layer]
+        deform.clear()
+        for name, weight in weights.items():
+            deform[group_indices[name]] = weight
+    bmesh.update_edit_mesh(source.obj.data, loop_triangles=False, destructive=False)
     return {
-        "matched_pair_count": len(matched_pairs),
-        "unmatched_source_count": len(unmatched_source),
-        "unmatched_target_count": len(unmatched_target),
-        "touched_source_vertex_count": len(matched_pairs),
-        "written_weight_count": written_weight_count,
-        "copied_group_count": len(copied_target_group_names),
+        "touched_source_vertex_count": len(updates),
+        "copied_vertex_count": copied_count,
+        "interpolated_vertex_count": len(updates) - copied_count,
+        "empty_vertex_count": sum(not weights for weights in updates),
+        "written_weight_count": sum(len(weights) for weights in updates),
+        "copied_group_count": len(required_names),
+        "maximum_distance": maximum_distance,
     }
 
 

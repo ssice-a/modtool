@@ -41,10 +41,6 @@ def _shape_key_blocks(obj):
     return shape_keys, list(shape_keys.key_blocks)
 
 
-def _non_basis_value_count(shape_key_blocks):
-    return sum(1 for key_block in shape_key_blocks[1:] if abs(float(key_block.value)) > _SHAPE_KEY_VALUE_EPSILON)
-
-
 def _collect_shape_key_metadata(shape_keys):
     metadata = []
     for index, key_block in enumerate(shape_keys.key_blocks):
@@ -414,15 +410,6 @@ def _flat_accumulate_scaled(base_coordinates, delta_coordinates, scale):
     )
 
 
-def _flat_scale_coordinates(coordinates, scale):
-    if abs(scale - 1.0) <= _SHAPE_KEY_VALUE_EPSILON:
-        return coordinates
-    if _np is not None:
-        return _np.asarray(coordinates, dtype=_np.float32) * float(scale)
-
-    return array("f", (float(coordinate) * float(scale) for coordinate in coordinates))
-
-
 def _flat_masked_coordinates(coordinates, weights):
     if weights is None:
         return coordinates
@@ -470,22 +457,6 @@ def _flat_vertex_group_weights(obj, group_name, vertex_count, weight_cache):
 def _shape_key_basis_delta(obj, key_block, delta_coordinates, vertex_count, weight_cache):
     weights = _flat_vertex_group_weights(obj, key_block.vertex_group, vertex_count, weight_cache)
     return _flat_masked_coordinates(delta_coordinates, weights)
-
-
-def _ensure_shape_key_range_remap_ready(obj, shape_keys, key_blocks):
-    if shape_keys is None or len(key_blocks) <= 1:
-        raise ValueError("The object needs at least one non-Basis shape key.")
-    if not getattr(shape_keys, "use_relative", True):
-        raise ValueError("Shape-key range remapping only supports relative shape keys.")
-    if getattr(obj, "show_only_shape_key", False):
-        raise ValueError("Disable solo shape-key view before remapping shape-key ranges.")
-
-    muted_key_names = [key_block.name for key_block in key_blocks[1:] if key_block.mute]
-    if muted_key_names:
-        preview_names = ", ".join(muted_key_names[:3])
-        if len(muted_key_names) > 3:
-            preview_names += f" (+{len(muted_key_names) - 3})"
-        raise ValueError(f"Unmute shape keys before remapping ranges: {preview_names}.")
 
 
 def _collect_relative_shape_key_coordinate_data(key_blocks):
@@ -559,162 +530,109 @@ def _write_shape_key_coordinates(key_blocks, coordinates_by_name):
         target_points.foreach_set("co", coordinates)
 
 
-def _shape_key_range_width(key_block):
-    return float(key_block.slider_max) - float(key_block.slider_min)
-
-
-def set_current_shape_key_values_as_zero(context, obj):
-    """Make the current relative shape-key mix the new zero point without changing the visible mesh."""
+def apply_unlocked_shape_keys(context, obj):
+    """Bake the current contribution of unlocked relative shape keys into Basis and remove them."""
     if not is_mesh_object(obj):
         raise ValueError("Choose a mesh object.")
 
     sync_edit_mesh_data(obj)
     shape_keys, key_blocks = _shape_key_blocks(obj)
-    _ensure_shape_key_range_remap_ready(obj, shape_keys, key_blocks)
+    if shape_keys is None or len(key_blocks) <= 1:
+        raise ValueError("The object needs at least one non-Basis shape key.")
+    if not shape_keys.use_relative:
+        raise ValueError("Apply Unlocked Shape Keys only supports relative shape keys.")
+    if obj.show_only_shape_key:
+        raise ValueError("Disable solo shape-key view before applying unlocked shape keys.")
 
+    basis_key = key_blocks[0]
+    unlocked_keys = [key_block for key_block in key_blocks[1:] if not key_block.lock_shape]
+    if not unlocked_keys:
+        raise ValueError("All non-Basis shape keys are locked.")
+
+    locked_keys = [key_block for key_block in key_blocks[1:] if key_block.lock_shape]
+    active_key_name = key_blocks[min(obj.active_shape_key_index, len(key_blocks) - 1)].name
     coordinate_data = _collect_relative_shape_key_coordinate_data(key_blocks)
-    basis_coordinates = coordinate_data["basis_coordinates"]
-    zero_basis_coordinates = basis_coordinates
-    nonzero_value_count = _non_basis_value_count(key_blocks)
-    value_by_name = {}
+    delta_item_by_name = {item["name"]: item for item in coordinate_data["delta_items"]}
+    baked_basis_coordinates = coordinate_data["basis_coordinates"]
     weight_cache = {}
-    vertex_count = len(key_blocks[0].data)
+    vertex_count = len(basis_key.data)
+    applied_value_count = 0
 
-    for key_block, item in zip(key_blocks[1:], coordinate_data["delta_items"]):
-        key_value = float(key_block.value)
-        value_by_name[key_block.name] = key_value
-        basis_delta_coordinates = _shape_key_basis_delta(
-            obj,
-            key_block,
-            item["delta_coordinates"],
-            vertex_count,
-            weight_cache,
+    for key_block in unlocked_keys:
+        if key_block.mute or abs(float(key_block.value)) <= _SHAPE_KEY_VALUE_EPSILON:
+            continue
+        delta_item = delta_item_by_name[key_block.name]
+        baked_basis_coordinates = _flat_accumulate_scaled(
+            baked_basis_coordinates,
+            _shape_key_basis_delta(
+                obj,
+                key_block,
+                delta_item["delta_coordinates"],
+                vertex_count,
+                weight_cache,
+            ),
+            key_block.value,
         )
-        zero_basis_coordinates = _flat_accumulate_scaled(
-            zero_basis_coordinates,
-            basis_delta_coordinates,
-            key_value,
-        )
+        applied_value_count += 1
 
-    rebuilt_coordinates = _rebuild_relative_shape_key_coordinates(
-        zero_basis_coordinates,
-        coordinate_data["basis_name"],
-        coordinate_data["delta_items"],
-    )
-    _write_shape_key_coordinates(key_blocks, rebuilt_coordinates)
-
-    for key_block in key_blocks[1:]:
-        key_value = value_by_name[key_block.name]
-        key_block.slider_min = float(key_block.slider_min) - key_value
-        key_block.slider_max = float(key_block.slider_max) - key_value
-        key_block.value = 0.0
-
-    obj.data.update()
-    context.view_layer.update()
-
-    return {
-        "object_name": obj.name,
-        "shape_key_count": max(0, len(key_blocks) - 1),
-        "nonzero_value_count": nonzero_value_count,
-        "uses_numpy": _np is not None,
-    }
-
-
-def normalize_shape_key_ranges(context, obj):
-    """Map every relative shape-key slider range to 0..1 without changing the visible mesh."""
-    if not is_mesh_object(obj):
-        raise ValueError("Choose a mesh object.")
-
-    sync_edit_mesh_data(obj)
-    shape_keys, key_blocks = _shape_key_blocks(obj)
-    _ensure_shape_key_range_remap_ready(obj, shape_keys, key_blocks)
-
-    zero_width_keys = [
-        key_block.name
-        for key_block in key_blocks[1:]
-        if _shape_key_range_width(key_block) <= _SHAPE_KEY_VALUE_EPSILON
-    ]
-    if zero_width_keys:
-        preview_names = ", ".join(zero_width_keys[:3])
-        if len(zero_width_keys) > 3:
-            preview_names += f" (+{len(zero_width_keys) - 3})"
-        raise ValueError(f"Cannot normalize zero-width shape-key ranges: {preview_names}.")
-
-    coordinate_data = _collect_relative_shape_key_coordinate_data(key_blocks)
-    normalized_basis_coordinates = coordinate_data["basis_coordinates"]
-    normalized_delta_items = []
-    metadata_by_name = {}
-    weight_cache = {}
-    vertex_count = len(key_blocks[0].data)
-
-    for key_block, item in zip(key_blocks[1:], coordinate_data["delta_items"]):
-        slider_min = float(key_block.slider_min)
-        slider_max = float(key_block.slider_max)
-        range_width = slider_max - slider_min
-        metadata_by_name[key_block.name] = {
-            "value": float(key_block.value),
-            "slider_min": slider_min,
-            "range_width": range_width,
-        }
-        basis_delta_coordinates = _shape_key_basis_delta(
-            obj,
-            key_block,
-            item["delta_coordinates"],
-            vertex_count,
-            weight_cache,
-        )
-        normalized_basis_coordinates = _flat_accumulate_scaled(
-            normalized_basis_coordinates,
-            basis_delta_coordinates,
-            slider_min,
-        )
-        normalized_delta_items.append(
+    retained_names = {basis_key.name, *(key_block.name for key_block in locked_keys)}
+    retained_delta_items = []
+    for key_block in locked_keys:
+        item = delta_item_by_name[key_block.name]
+        relative_name = item["relative_name"]
+        retained_delta_items.append(
             {
-                "name": item["name"],
-                "relative_name": item["relative_name"],
-                "delta_coordinates": _flat_scale_coordinates(item["delta_coordinates"], range_width),
+                "name": key_block.name,
+                "relative_name": relative_name if relative_name in retained_names else basis_key.name,
+                "delta_coordinates": item["delta_coordinates"],
             }
         )
 
     rebuilt_coordinates = _rebuild_relative_shape_key_coordinates(
-        normalized_basis_coordinates,
-        coordinate_data["basis_name"],
-        normalized_delta_items,
+        baked_basis_coordinates,
+        basis_key.name,
+        retained_delta_items,
     )
-    _write_shape_key_coordinates(key_blocks, rebuilt_coordinates)
+    _apply_flat_coordinates_to_mesh(obj.data, baked_basis_coordinates)
 
-    changed_range_count = 0
-    for key_block in key_blocks[1:]:
-        metadata = metadata_by_name[key_block.name]
-        normalized_value = (metadata["value"] - metadata["slider_min"]) / metadata["range_width"]
-        if (
-            abs(float(key_block.slider_min)) > _SHAPE_KEY_VALUE_EPSILON
-            or abs(float(key_block.slider_max) - 1.0) > _SHAPE_KEY_VALUE_EPSILON
-        ):
-            changed_range_count += 1
-        key_block.slider_min = 0.0
-        key_block.slider_max = 1.0
-        key_block.value = normalized_value
+    for key_block in reversed(unlocked_keys):
+        obj.shape_key_remove(key_block)
+
+    _new_shape_keys, new_key_blocks = _shape_key_blocks(obj)
+    new_basis_key = new_key_blocks[0]
+    basis_points = getattr(new_basis_key, "points", new_basis_key.data)
+    basis_points.foreach_set("co", baked_basis_coordinates)
+    _write_shape_key_coordinates(new_key_blocks[1:], rebuilt_coordinates)
+
+    new_key_by_name = {key_block.name: key_block for key_block in new_key_blocks}
+    for item in retained_delta_items:
+        key_block = new_key_by_name[item["name"]]
+        key_block.relative_key = new_key_by_name.get(item["relative_name"], new_basis_key)
 
     obj.data.update()
     context.view_layer.update()
+    obj.active_shape_key_index = next(
+        (index for index, key_block in enumerate(new_key_blocks) if key_block.name == active_key_name),
+        0,
+    )
 
     return {
         "object_name": obj.name,
-        "shape_key_count": max(0, len(key_blocks) - 1),
-        "changed_range_count": changed_range_count,
+        "applied_shape_key_count": len(unlocked_keys),
+        "applied_value_count": applied_value_count,
+        "locked_shape_key_count": len(locked_keys),
         "uses_numpy": _np is not None,
     }
 
 
-def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
-    """Apply enabled modifiers through the chosen modifier while preserving shape keys."""
+def apply_enabled_modifiers(context, obj, modifier_name=""):
+    """Bake enabled modifiers, rebuilding shape keys only when present."""
     if not is_mesh_object(obj):
         raise ValueError("Choose a mesh object.")
+    if not obj.is_editable:
+        raise ValueError("The mesh object is not editable.")
 
     sync_edit_mesh_data(obj)
-    if not has_shape_keys(obj):
-        raise ValueError("The object has no shape keys to preserve.")
     if len(obj.modifiers) == 0:
         raise ValueError("The object has no modifiers.")
 
@@ -723,7 +641,7 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
     runtime_state = _capture_runtime_state(obj)
     old_mesh = obj.data
     old_shape_keys = getattr(old_mesh, "shape_keys", None)
-    shape_key_info = _collect_shape_key_metadata(old_shape_keys)
+    shape_key_info = _collect_shape_key_metadata(old_shape_keys) if old_shape_keys else None
     depsgraph = context.evaluated_depsgraph_get()
     flat_key_coordinates = []
     applied_mesh = None
@@ -734,27 +652,31 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         context.view_layer.update()
 
         applied_mesh = _create_evaluated_mesh_snapshot(obj, depsgraph)
-        expected_vertex_count = len(applied_mesh.vertices)
-
-        preview_shape_keys = _prepare_shape_key_preview_capture(obj)
-        _set_preview_shape(obj, preview_shape_keys, 0)
-        context.view_layer.update()
-        basis_coordinates, _basis_vertex_count = _capture_flat_vertex_coordinates(
-            obj,
-            depsgraph,
-            expected_vertex_count=expected_vertex_count,
-        )
-        _apply_flat_coordinates_to_mesh(applied_mesh, basis_coordinates)
-
-        for key_info in shape_key_info["key_blocks"][1:]:
-            _set_preview_shape(obj, preview_shape_keys, key_info["index"])
+        if shape_key_info:
+            expected_vertex_count = len(applied_mesh.vertices)
+            preview_shape_keys = _prepare_shape_key_preview_capture(obj)
+            _set_preview_shape(obj, preview_shape_keys, 0)
             context.view_layer.update()
-            flat_coordinates, _vertex_count = _capture_flat_vertex_coordinates(
+            basis_coordinates, _basis_vertex_count = _capture_flat_vertex_coordinates(
                 obj,
                 depsgraph,
                 expected_vertex_count=expected_vertex_count,
             )
-            flat_key_coordinates.append(flat_coordinates)
+            _apply_flat_coordinates_to_mesh(applied_mesh, basis_coordinates)
+
+            for key_info in shape_key_info["key_blocks"][1:]:
+                _set_preview_shape(obj, preview_shape_keys, key_info["index"])
+                context.view_layer.update()
+                flat_coordinates, _vertex_count = _capture_flat_vertex_coordinates(
+                    obj,
+                    depsgraph,
+                    expected_vertex_count=expected_vertex_count,
+                )
+                flat_key_coordinates.append(flat_coordinates)
+    except Exception:
+        if applied_mesh is not None and applied_mesh.users == 0:
+            bpy.data.meshes.remove(applied_mesh)
+        raise
     finally:
         _restore_runtime_state(obj, runtime_state)
         _restore_modifier_states(obj, original_modifier_states)
@@ -771,8 +693,9 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
         context.view_layer.update()
 
         obj.data = applied_mesh
-        _rebuild_shape_keys(obj, shape_key_info, flat_key_coordinates)
-        _restore_new_runtime_state(obj, runtime_state)
+        if shape_key_info:
+            _rebuild_shape_keys(obj, shape_key_info, flat_key_coordinates)
+            _restore_new_runtime_state(obj, runtime_state)
 
         if old_shape_keys is not None and obj.data.shape_keys is not None:
             action_restore_info = _copy_shape_key_animation(old_shape_keys, obj.data.shape_keys)
@@ -800,7 +723,7 @@ def apply_modifier_with_shape_keys(context, obj, modifier_name=""):
 
     return {
         "applied_modifier_names": apply_modifier_names,
-        "shape_key_count": max(0, len(shape_key_info["key_blocks"]) - 1),
+        "shape_key_count": max(0, len(shape_key_info["key_blocks"]) - 1) if shape_key_info else 0,
         "vertex_count": len(obj.data.vertices),
         "vertex_group_count": len(obj.vertex_groups),
         "action_copied": action_restore_info["action_copied"],

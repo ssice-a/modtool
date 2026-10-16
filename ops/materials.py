@@ -3,7 +3,12 @@
 import bpy
 
 from ..core.common import ensure_object_mode, get_selected_mesh_objects, is_mesh_object, restore_context_mode
-from ..core.materials import assign_single_material_to_object, rename_object_from_material
+from ..core.materials import (
+    assign_single_material_to_object,
+    merge_base_color_for_sp,
+    rename_object_from_material,
+    restore_base_color_from_sp,
+)
 
 
 class MDT_OT_create_named_materials(bpy.types.Operator):
@@ -129,4 +134,84 @@ class MDT_OT_separate_by_material(bpy.types.Operator):
             {"INFO"},
             f"Split selected meshes by material. Renamed {renamed_count} object(s). Skipped {skipped_count} object(s).",
         )
+        return {"FINISHED"}
+
+
+class MDT_OT_merge_base_color_for_sp(bpy.types.Operator):
+    """Temporarily reduce the active mesh to one Base Color material for SP."""
+
+    bl_idname = "mdt.merge_base_color_for_sp"
+    bl_label = "Merge Base Color for SP"
+    bl_description = "Create one Base Color atlas material for the active mesh and store data for a later restore"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, _context):
+        return True
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if not is_mesh_object(obj):
+            self.report({"ERROR"}, "Make one mesh object active.")
+            return {"CANCELLED"}
+
+        try:
+            previous_mode = ensure_object_mode(context)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not switch to Object Mode: {exc}")
+            return {"CANCELLED"}
+
+        try:
+            settings = context.scene.mdt_base_color_sp_settings
+            result = merge_base_color_for_sp(
+                obj,
+                directory=settings.directory,
+                grid_size=int(settings.grid_size),
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        finally:
+            restore_context_mode(previous_mode)
+
+        self.report(
+            {"INFO"},
+            (
+                f"Merged {result['material_count']} material(s) into {result['filepath']} "
+                f"({result['atlas_width']}x{result['atlas_height']})."
+            ),
+        )
+        return {"FINISHED"}
+
+
+class MDT_OT_restore_base_color_from_sp(bpy.types.Operator):
+    """Restore materials and split the painted Base Color atlas."""
+
+    bl_idname = "mdt.restore_base_color_from_sp"
+    bl_label = "Restore Base Color Materials"
+    bl_description = "Split the painted Base Color atlas, restore the original UV layout and material slots"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, _context):
+        return True
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if not is_mesh_object(obj):
+            self.report({"ERROR"}, "Make the SP-prepared mesh object active.")
+            return {"CANCELLED"}
+        try:
+            previous_mode = ensure_object_mode(context)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not switch to Object Mode: {exc}")
+            return {"CANCELLED"}
+        try:
+            result = restore_base_color_from_sp(obj)
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        finally:
+            restore_context_mode(previous_mode)
+        self.report({"INFO"}, f"Restored {result['material_count']} Base Color material texture(s).")
         return {"FINISHED"}

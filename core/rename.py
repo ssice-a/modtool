@@ -5,13 +5,15 @@ from __future__ import annotations
 from array import array
 import re
 
-from mathutils import Vector
+import numpy as np
+from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-from .common import get_flat_point_coordinates, is_armature_object, sync_edit_mesh_data
+from .common import is_armature_object, sync_edit_mesh_data
 
 
 _WEIGHT_EPSILON = 1.0e-8
+_AUTO_MIRROR_LOCAL_SCALE_FACTOR = 1.5
 
 _BIP001_BODY_EXACT_PARTS = {
     "pelvis",
@@ -74,34 +76,13 @@ _NON_BODY_GROUP_TOKENS = (
     "socket",
     "fx",
 )
-_SIDE_NAME_REPLACEMENTS = (
-    ("-L-", "-R-"),
-    ("-R-", "-L-"),
-    ("-l-", "-r-"),
-    ("-r-", "-l-"),
-    ("_L_", "_R_"),
-    ("_R_", "_L_"),
-    ("_l_", "_r_"),
-    ("_r_", "_l_"),
-)
-_SIDE_NAME_SUFFIX_REPLACEMENTS = (
-    ("_L", "_R"),
-    ("_R", "_L"),
-    ("_l", "_r"),
-    ("_r", "_l"),
-    (".L", ".R"),
-    (".R", ".L"),
-    (".l", ".r"),
-    (".r", ".l"),
-    ("-L", "-R"),
-    ("-R", "-L"),
-    ("-l", "-r"),
-    ("-r", "-l"),
-)
-_LEFT_SIDE_TOKENS = ("-L-", "-l-", "_L_", "_l_")
-_RIGHT_SIDE_TOKENS = ("-R-", "-r-", "_R_", "_r_")
-_LEFT_SIDE_SUFFIXES = ("_L", "_l", ".L", ".l", "-L", "-l")
-_RIGHT_SIDE_SUFFIXES = ("_R", "_r", ".R", ".r", "-R", "-r")
+_SIDE_NAME_PATTERN = re.compile(r"(^|[_.-])([LlRr])(?=[_.-]|$|[A-Z][a-z])")
+
+
+def _side_name_match(name):
+    matches = list(_SIDE_NAME_PATTERN.finditer(name))
+    # Conflicting side labels cannot define a unique name pair.
+    return matches[0] if len(matches) == 1 else None
 
 
 def has_rename_rule(settings):
@@ -394,9 +375,8 @@ def clean_disconnected_vertex_group_weights(obj):
     entries_by_group_index = _collect_vertex_group_weight_entries(obj)
 
     processed_group_count = 0
-    cleaned_group_count = 0
-    removed_weight_count = 0
-    removed_component_count = 0
+    removal_components = []
+    removals_by_group_index = {}
 
     for group in obj.vertex_groups:
         entries = entries_by_group_index[group.index]
@@ -416,25 +396,74 @@ def clean_disconnected_vertex_group_weights(obj):
                 components[component_index][1],
             ),
         )
-        remove_vertex_indices = []
         for component_index, _component in enumerate(components):
             if component_index == keep_index:
                 continue
-            remove_vertex_indices.extend(components[component_index][2])
+            component_vertices = set(components[component_index][2])
+            removal_components.append((group.index, component_vertices))
+            removals_by_group_index.setdefault(group.index, set()).update(component_vertices)
 
-        if not remove_vertex_indices:
+    deform_group_by_index = _resolve_deforming_group_map(obj)
+    preserved_last_weight_count = 0
+    deform_removal_vertices = set().union(
+        *(
+            vertex_indices
+            for group_index, vertex_indices in removals_by_group_index.items()
+            if group_index in deform_group_by_index
+        ),
+        set(),
+    )
+    for vertex_index in deform_removal_vertices:
+        assignments = [
+            assignment
+            for assignment in obj.data.vertices[vertex_index].groups
+            if assignment.group in deform_group_by_index and assignment.weight > _WEIGHT_EPSILON
+        ]
+        remaining_total = sum(
+            assignment.weight
+            for assignment in assignments
+            if vertex_index not in removals_by_group_index.get(assignment.group, ())
+        )
+        if remaining_total > _WEIGHT_EPSILON:
             continue
 
-        group.remove(remove_vertex_indices)
+        removable_assignments = [
+            assignment
+            for assignment in assignments
+            if vertex_index in removals_by_group_index.get(assignment.group, ())
+        ]
+        if not removable_assignments:
+            continue
+        preserved_assignment = max(removable_assignments, key=lambda assignment: assignment.weight)
+        removals_by_group_index[preserved_assignment.group].discard(vertex_index)
+        preserved_last_weight_count += 1
+
+    affected_deform_vertices = set()
+    removed_weight_count = 0
+    cleaned_group_count = 0
+    for group_index, vertex_indices in removals_by_group_index.items():
+        if not vertex_indices:
+            continue
+        obj.vertex_groups[group_index].remove(list(vertex_indices))
         cleaned_group_count += 1
-        removed_weight_count += len(remove_vertex_indices)
-        removed_component_count += len(components) - 1
+        removed_weight_count += len(vertex_indices)
+        if group_index in deform_group_by_index:
+            affected_deform_vertices.update(vertex_indices)
+
+    normalization_result = _normalize_deforming_weights(obj, affected_deform_vertices)
+    removed_component_count = sum(
+        1
+        for group_index, component_vertices in removal_components
+        if component_vertices & removals_by_group_index.get(group_index, set())
+    )
 
     return {
         "processed_group_count": processed_group_count,
         "cleaned_group_count": cleaned_group_count,
         "removed_weight_count": removed_weight_count,
         "removed_component_count": removed_component_count,
+        "normalized_vertex_count": normalization_result["normalized_vertex_count"],
+        "preserved_last_weight_count": preserved_last_weight_count,
     }
 
 
@@ -452,6 +481,48 @@ def _resolve_deforming_bone_names(obj):
             if getattr(bone, "use_deform", False):
                 bone_names.add(bone.name)
     return bone_names
+
+
+def _resolve_deforming_group_map(obj):
+    deforming_bone_names = _resolve_deforming_bone_names(obj)
+    return {
+        group.index: group
+        for group in getattr(obj, "vertex_groups", ())
+        if group.name in deforming_bone_names
+    }
+
+
+def _normalize_deforming_weights(obj, vertex_indices):
+    deform_group_by_index = _resolve_deforming_group_map(obj)
+    normalized_vertex_count = 0
+    unweighted_vertex_count = 0
+
+    for vertex_index in set(vertex_indices):
+        assignments = [
+            (assignment.group, float(assignment.weight))
+            for assignment in obj.data.vertices[vertex_index].groups
+            if assignment.group in deform_group_by_index and assignment.weight > _WEIGHT_EPSILON
+        ]
+        total = sum(weight for _group_index, weight in assignments)
+        if total <= _WEIGHT_EPSILON:
+            unweighted_vertex_count += 1
+            continue
+        if abs(total - 1.0) <= 1.0e-6:
+            continue
+
+        inverse_total = 1.0 / total
+        for group_index, weight in assignments:
+            deform_group_by_index[group_index].add(
+                (vertex_index,),
+                weight * inverse_total,
+                "REPLACE",
+            )
+        normalized_vertex_count += 1
+
+    return {
+        "normalized_vertex_count": normalized_vertex_count,
+        "unweighted_vertex_count": unweighted_vertex_count,
+    }
 
 
 def _keepable_deforming_group_names(obj):
@@ -671,23 +742,19 @@ def remove_non_body_vertex_groups(obj, armature_objects=None):
 
 def mirror_vertex_group_side_name(name):
     """Return the opposite-side vertex-group name candidate, or None for center names."""
-    for source_token, target_token in _SIDE_NAME_REPLACEMENTS:
-        if source_token in name:
-            return name.replace(source_token, target_token, 1)
-
-    for source_suffix, target_suffix in _SIDE_NAME_SUFFIX_REPLACEMENTS:
-        if name.endswith(source_suffix):
-            return f"{name[: -len(source_suffix)]}{target_suffix}"
-
-    return None
+    match = _side_name_match(name)
+    if match is None:
+        return None
+    index = match.start(2)
+    opposite = {"L": "R", "R": "L", "l": "r", "r": "l"}[match.group(2)]
+    return name[:index] + opposite + name[index + 1:]
 
 
 def _vertex_group_side(name):
-    if any(token in name for token in _LEFT_SIDE_TOKENS) or name.endswith(_LEFT_SIDE_SUFFIXES):
-        return "LEFT"
-    if any(token in name for token in _RIGHT_SIDE_TOKENS) or name.endswith(_RIGHT_SIDE_SUFFIXES):
-        return "RIGHT"
-    return None
+    match = _side_name_match(name)
+    if match is None:
+        return None
+    return "LEFT" if match.group(2).lower() == "l" else "RIGHT"
 
 
 def _build_mirror_group_pairs(obj):
@@ -715,156 +782,238 @@ def _build_mirror_group_pairs(obj):
     return group_pairs
 
 
-def _read_sparse_group_weights(obj, group_name):
-    vertex_group = obj.vertex_groups.get(group_name)
-    if vertex_group is None:
-        return {}
-
-    weights_by_vertex_index = {}
-    group_index = vertex_group.index
-    for vertex in obj.data.vertices:
-        for assignment in vertex.groups:
-            if assignment.group == group_index and assignment.weight > _WEIGHT_EPSILON:
-                weights_by_vertex_index[vertex.index] = float(assignment.weight)
-                break
-    return weights_by_vertex_index
-
-
-def _clear_group_weights(obj, group_names):
-    group_indices = {
-        group.index: group
-        for group in obj.vertex_groups
-        if group.name in group_names
-    }
-    if not group_indices:
+def _write_group_weight_array(group, indices, weights):
+    """Batch equal stored weights instead of issuing one RNA call per vertex."""
+    if not len(indices):
         return 0
-
-    vertices_by_group_index = {group_index: [] for group_index in group_indices}
-    for vertex in obj.data.vertices:
-        for assignment in vertex.groups:
-            if assignment.group in vertices_by_group_index:
-                vertices_by_group_index[assignment.group].append(vertex.index)
-
-    cleared_count = 0
-    for group_index, vertex_indices in vertices_by_group_index.items():
-        if not vertex_indices:
-            continue
-        group_indices[group_index].remove(vertex_indices)
-        cleared_count += len(vertex_indices)
-    return cleared_count
+    order = np.argsort(weights, kind="stable")
+    weights = weights[order]
+    boundaries = np.r_[0, np.flatnonzero(np.diff(weights)) + 1, len(weights)]
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        group.add(indices[order[start:end]].tolist(), float(weights[start]), "REPLACE")
+    return len(indices)
 
 
-def _write_sparse_group_weights(obj, group_name, weights_by_vertex_index):
-    vertex_group = obj.vertex_groups.get(group_name)
-    if vertex_group is None:
-        return 0
-
-    written_count = 0
-    for vertex_index, weight in weights_by_vertex_index.items():
-        vertex_group.add((vertex_index,), min(1.0, weight), "REPLACE")
-        written_count += 1
-    return written_count
+def _mesh_coordinate_array(mesh):
+    coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coordinates)
+    return coordinates.reshape((-1, 3))
 
 
-def _custom_mirror_tolerance(flat_coordinates):
-    if not flat_coordinates:
+def _mirror_coordinate_array(obj):
+    """Use the displayed shape-key mix, without armature or modifier deformation."""
+    if obj.data.shape_keys is None:
+        return _mesh_coordinate_array(obj.data)
+    import bpy
+
+    probe = obj.copy()
+    evaluated = None
+    try:
+        for modifier in probe.modifiers:
+            modifier.show_viewport = False
+        bpy.context.scene.collection.objects.link(probe)
+        probe.hide_set(True)
+        evaluated = probe.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        if len(mesh.vertices) != len(obj.data.vertices):
+            raise ValueError("Shape-key evaluation changed the weight vertex correspondence.")
+        return _mesh_coordinate_array(mesh)
+    finally:
+        if evaluated is not None:
+            evaluated.to_mesh_clear()
+        bpy.data.objects.remove(probe, do_unlink=True)
+
+
+def _mesh_triangle_array(mesh):
+    mesh.calc_loop_triangles()
+    triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", triangles)
+    triangles = triangles.reshape((-1, 3))
+    if len(triangles) == 0:
+        raise ValueError("Weight mirroring requires a mesh with faces.")
+    return triangles
+
+
+def _mesh_edge_lengths(mesh, coordinates):
+    if len(mesh.edges) == 0:
+        return np.empty((0, 2), dtype=np.int32), np.empty(0, dtype=np.float64)
+
+    edge_vertices = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+    mesh.edges.foreach_get("vertices", edge_vertices)
+    edge_vertices = edge_vertices.reshape((-1, 2))
+    edge_lengths = np.linalg.norm(
+        coordinates[edge_vertices[:, 0]] - coordinates[edge_vertices[:, 1]],
+        axis=1,
+    )
+    return edge_vertices, edge_lengths
+
+
+def _surface_mirror_tolerance(edge_lengths, requested_tolerance):
+    if requested_tolerance > 0.0:
+        return float(requested_tolerance)
+    positive_lengths = edge_lengths[edge_lengths > 1.0e-8]
+    if len(positive_lengths) == 0:
         return 1.0e-5
-
-    min_x = max_x = flat_coordinates[0]
-    min_y = max_y = flat_coordinates[1]
-    min_z = max_z = flat_coordinates[2]
-    for coordinate_index in range(3, len(flat_coordinates), 3):
-        x = flat_coordinates[coordinate_index]
-        y = flat_coordinates[coordinate_index + 1]
-        z = flat_coordinates[coordinate_index + 2]
-        min_x = min(min_x, x)
-        max_x = max(max_x, x)
-        min_y = min(min_y, y)
-        max_y = max(max_y, y)
-        min_z = min(min_z, z)
-        max_z = max(max_z, z)
-
-    diagonal = Vector((max_x - min_x, max_y - min_y, max_z - min_z)).length
-    return max(1.0e-5, diagonal * 0.0005)
+    return max(1.0e-5, float(np.median(positive_lengths)))
 
 
-def _build_vertex_kdtree(flat_coordinates, vertex_count):
-    kd_tree = KDTree(vertex_count)
-    for vertex_index in range(vertex_count):
-        coordinate_index = vertex_index * 3
-        kd_tree.insert(
-            Vector(
-                (
-                    flat_coordinates[coordinate_index],
-                    flat_coordinates[coordinate_index + 1],
-                    flat_coordinates[coordinate_index + 2],
-                )
-            ),
-            vertex_index,
-        )
-    kd_tree.balance()
-    return kd_tree
+def _mirror_left_sign(coordinates, weights, groups, group_pairs):
+    """Infer which X half contains named left groups, independent of bone names."""
+    columns = {group.name: index for index, group in enumerate(groups)}
+    evidence = []
+    for left, right in group_pairs:
+        if left not in columns or right not in columns:
+            continue
+        lw, rw = weights[:, columns[left]], weights[:, columns[right]]
+        lt, rt = float(lw.sum()), float(rw.sum())
+        if lt > _WEIGHT_EPSILON and rt > _WEIGHT_EPSILON:
+            evidence.append(float(np.dot(coordinates[:, 0], lw) / lt
+                                  - np.dot(coordinates[:, 0], rw) / rt))
+        elif lt > _WEIGHT_EPSILON:
+            evidence.append(float(np.dot(coordinates[:, 0], lw) / lt))
+        elif rt > _WEIGHT_EPSILON:
+            evidence.append(-float(np.dot(coordinates[:, 0], rw) / rt))
+    if not evidence:
+        return 1.0
+    return 1.0 if np.median(evidence) >= 0.0 else -1.0
+
+
+def _build_surface_mirror_samples(mesh, coordinates, source_sign, tolerance):
+    """Match only the destination half; use exact vertices before surface interpolation."""
+    vertex_count = len(coordinates)
+    axis_epsilon = max(1e-8, float(np.ptp(coordinates[:, 0])) * 1e-7)
+    target_ids = np.flatnonzero(coordinates[:, 0] * source_sign < -axis_epsilon)
+    source_ids = np.flatnonzero(coordinates[:, 0] * source_sign >= -axis_epsilon)
+    edge_vertices, edge_lengths = _mesh_edge_lengths(mesh, coordinates)
+    base_tolerance = _surface_mirror_tolerance(edge_lengths, tolerance)
+    sample_indices = np.zeros((len(target_ids), 3), dtype=np.int32)
+    barycentric = np.zeros((len(target_ids), 3), dtype=np.float32)
+    distances = np.full(len(target_ids), np.inf)
+    limits = np.full(len(target_ids), base_tolerance)
+    exact = np.zeros(len(target_ids), dtype=bool)
+    if not len(source_ids) or not len(target_ids):
+        return target_ids, sample_indices, barycentric, distances, limits, exact, base_tolerance
+
+    source_tree = KDTree(len(source_ids))
+    for index in source_ids:
+        source_tree.insert(coordinates[index], int(index))
+    source_tree.balance()
+    mirrored = coordinates[target_ids].copy()
+    mirrored[:, 0] *= -1.0
+    exact_tolerance = max(1e-7, float(np.linalg.norm(np.ptp(coordinates, axis=0))) * 1e-6)
+    if tolerance > 0.0:
+        exact_tolerance = min(exact_tolerance, tolerance)
+    for row, point in enumerate(mirrored):
+        _coordinate, index, distance = source_tree.find(point)
+        if distance <= exact_tolerance:
+            sample_indices[row] = index
+            barycentric[row] = (1.0, 0.0, 0.0)
+            distances[row] = distance
+            exact[row] = True
+
+    remaining = np.flatnonzero(~exact)
+    if not len(remaining):
+        return target_ids, sample_indices, barycentric, distances, limits, exact, base_tolerance
+    triangles = _mesh_triangle_array(mesh)
+    tri_a, tri_b, tri_c = (coordinates[triangles[:, i]] for i in range(3))
+    valid = (np.linalg.norm(np.cross(tri_b - tri_a, tri_c - tri_a), axis=1) > 1e-12)
+    valid &= np.all(coordinates[triangles, 0] * source_sign >= -axis_epsilon, axis=1)
+    triangles = triangles[valid]
+    if not len(triangles):
+        return target_ids, sample_indices, barycentric, distances, limits, exact, base_tolerance
+    tree = BVHTree.FromPolygons(coordinates, triangles, all_triangles=True)
+    local_scale = np.zeros(vertex_count)
+    np.maximum.at(local_scale, edge_vertices[:, 0], edge_lengths)
+    np.maximum.at(local_scale, edge_vertices[:, 1], edge_lengths)
+    hit_points = []
+    hit_rows = []
+    for row in remaining:
+        point, _normal, triangle, distance = tree.find_nearest(mirrored[row])
+        if triangle is None:
+            continue
+        sample_indices[row] = triangles[triangle]
+        distances[row] = distance
+        hit_points.append(point)
+        hit_rows.append(row)
+    rows = np.asarray(hit_rows, dtype=np.int32)
+    if len(rows):
+        a, b, c = (coordinates[sample_indices[rows, i]] for i in range(3))
+        ab, ac, offset = b - a, c - a, np.asarray(hit_points) - a
+        dot = lambda x, y: np.einsum("ij,ij->i", x, y)
+        d00, d01, d11 = dot(ab, ab), dot(ab, ac), dot(ac, ac)
+        denominator = d00 * d11 - d01 * d01
+        usable = np.abs(denominator) > 1e-20
+        wb = np.zeros(len(rows)); wc = np.zeros(len(rows))
+        wb[usable] = (d11[usable] * dot(offset, ab)[usable]
+                      - d01[usable] * dot(offset, ac)[usable]) / denominator[usable]
+        wc[usable] = (d00[usable] * dot(offset, ac)[usable]
+                      - d01[usable] * dot(offset, ab)[usable]) / denominator[usable]
+        values = np.column_stack((1.0 - wb - wc, wb, wc))
+        np.clip(values, 0.0, 1.0, out=values)
+        values /= values.sum(axis=1, keepdims=True)
+        barycentric[rows] = values
+        distances[rows[~usable]] = np.inf
+        if tolerance <= 0.0:
+            triangle_scale = np.maximum.reduce((np.linalg.norm(ab, axis=1),
+                                                np.linalg.norm(ac, axis=1),
+                                                np.linalg.norm(b - c, axis=1)))
+            limits[rows] = np.maximum(base_tolerance,
+                np.maximum(local_scale[target_ids[rows]], triangle_scale)
+                * _AUTO_MIRROR_LOCAL_SCALE_FACTOR)
+    return target_ids, sample_indices, barycentric, distances, limits, exact, base_tolerance
 
 
 def _custom_mirror_weights(obj, source_to_target, tolerance=0.0):
-    flat_coordinates = get_flat_point_coordinates(obj.data.vertices)
-    vertex_count = len(obj.data.vertices)
-    if tolerance <= 0.0:
-        tolerance = _custom_mirror_tolerance(flat_coordinates)
-
-    kd_tree = _build_vertex_kdtree(flat_coordinates, vertex_count)
-    group_by_name = {group.name: group for group in obj.vertex_groups}
-    source_index_to_target_name = {
-        group_by_name[source_name].index: target_name
-        for source_name, target_name in source_to_target.items()
-        if source_name in group_by_name and target_name in group_by_name
-    }
-    weights_by_target_name = {target_name: {} for target_name in source_to_target.values()}
-    mirrored_vertex_by_source = {}
-    unmatched_vertex_count = 0
-
+    mirrored = dict(source_to_target)
+    mirrored.update({target: source for source, target in source_to_target.items()})
+    deform = _resolve_deforming_group_map(obj)
+    groups = [group for group in obj.vertex_groups if group.name in mirrored or (
+        group.index in deform and _vertex_group_side(group.name) is None)]
+    columns = {group.index: index for index, group in enumerate(groups)}
+    name_columns = {group.name: index for index, group in enumerate(groups)}
+    weights = np.zeros((len(obj.data.vertices), len(groups)), dtype=np.float32)
     for vertex in obj.data.vertices:
-        source_assignments = [
-            assignment
-            for assignment in vertex.groups
-            if assignment.group in source_index_to_target_name and assignment.weight > _WEIGHT_EPSILON
-        ]
-        if not source_assignments:
+        for assignment in vertex.groups:
+            column = columns.get(assignment.group)
+            if column is not None:
+                weights[vertex.index, column] = assignment.weight
+    coordinates = _mirror_coordinate_array(obj)
+    pairs = [(source, target) if _vertex_group_side(source) == "LEFT" else (target, source)
+             for source, target in source_to_target.items()]
+    sign = _mirror_left_sign(coordinates, weights, groups, pairs)
+    if _vertex_group_side(next(iter(source_to_target))) == "RIGHT":
+        sign *= -1.0
+    target_ids, indices, barycentric, distances, limits, exact, used_tolerance = (
+        _build_surface_mirror_samples(obj.data, coordinates, sign, tolerance))
+    reliable = distances <= limits
+    matched_ids = target_ids[reliable]
+    samples = np.einsum("vi,vij->vj", barycentric[reliable], weights[indices[reliable]])
+    output_columns = [name_columns[mirrored.get(group.name, group.name)] for group in groups]
+    output = np.empty_like(samples)
+    output[:, output_columns] = samples
+    # No implicit normalization: a mirror must preserve source numerical values,
+    # including a zero source weight. Centerline and source-half vertices stay untouched.
+    for column, group in enumerate(groups):
+        if group.lock_weight and np.any(np.abs(output[:, column] - weights[matched_ids, column]) > 1e-7):
+            raise ValueError(f"Unlock vertex group '{group.name}' before mirroring weights.")
+    cleared = int(np.count_nonzero(weights[matched_ids] > _WEIGHT_EPSILON))
+    removals = matched_ids.tolist()
+    written = 0
+    for column, group in enumerate(groups):
+        if group.lock_weight or not len(matched_ids):
             continue
-
-        coordinate_index = vertex.index * 3
-        mirrored_coordinate = Vector(
-            (
-                -flat_coordinates[coordinate_index],
-                flat_coordinates[coordinate_index + 1],
-                flat_coordinates[coordinate_index + 2],
-            )
-        )
-        _found_coordinate, target_vertex_index, distance = kd_tree.find(mirrored_coordinate)
-        if target_vertex_index is None or distance > tolerance:
-            unmatched_vertex_count += 1
-            continue
-
-        mirrored_vertex_by_source[vertex.index] = target_vertex_index
-        for assignment in source_assignments:
-            target_name = source_index_to_target_name[assignment.group]
-            target_weights = weights_by_target_name[target_name]
-            target_weights[target_vertex_index] = min(
-                1.0,
-                target_weights.get(target_vertex_index, 0.0) + float(assignment.weight),
-            )
-
-    cleared_weight_count = _clear_group_weights(obj, set(weights_by_target_name))
-    written_weight_count = 0
-    for target_name, weights_by_vertex_index in weights_by_target_name.items():
-        written_weight_count += _write_sparse_group_weights(obj, target_name, weights_by_vertex_index)
-
+        group.remove(removals)
+        local = np.flatnonzero(output[:, column] > _WEIGHT_EPSILON)
+        written += _write_group_weight_array(group, matched_ids[local], output[local, column])
+    obj.data.update()
     return {
-        "cleared_weight_count": cleared_weight_count,
-        "written_weight_count": written_weight_count,
-        "unmatched_vertex_count": unmatched_vertex_count,
-        "paired_vertex_count": len(mirrored_vertex_by_source),
-        "tolerance": tolerance,
+        "cleared_weight_count": cleared,
+        "written_weight_count": written,
+        "unmatched_vertex_count": int(np.count_nonzero(~reliable)),
+        "paired_vertex_count": len(matched_ids),
+        "exact_vertex_count": int(np.count_nonzero(exact & reliable)),
+        "interpolated_vertex_count": int(np.count_nonzero(~exact & reliable)),
+        "tolerance": used_tolerance,
     }
 
 

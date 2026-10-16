@@ -4,11 +4,10 @@ import bpy
 
 from ..core.common import ensure_object_mode, get_selected_mesh_objects, restore_context_mode
 from ..core.modifier_apply import (
-    apply_modifier_with_shape_keys,
+    apply_unlocked_shape_keys,
+    apply_enabled_modifiers,
     get_enabled_modifier_names,
     has_shape_keys,
-    normalize_shape_key_ranges,
-    set_current_shape_key_values_as_zero,
 )
 
 
@@ -34,56 +33,13 @@ def _selected_shape_key_objects(context):
     return [], [obj.name] if obj is not None else []
 
 
-def _execute_shape_key_range_operation(operator, context, operation, action_label):
-    target_objects, skipped_no_shape_keys = _selected_shape_key_objects(context)
-    if len(target_objects) == 0:
-        operator.report({"ERROR"}, "Select at least one mesh object with shape keys.")
-        return {"CANCELLED"}
-
-    try:
-        previous_mode = ensure_object_mode(context)
-    except RuntimeError as exc:
-        operator.report({"ERROR"}, f"Could not switch to Object Mode: {exc}")
-        return {"CANCELLED"}
-
-    results = []
-    failures = []
-    try:
-        for obj in target_objects:
-            try:
-                results.append((obj.name, operation(context, obj)))
-            except ValueError as exc:
-                failures.append(f"{obj.name}: {exc}")
-    finally:
-        restore_context_mode(previous_mode)
-
-    if len(results) == 0:
-        operator.report({"ERROR"}, failures[0] if failures else "No selected object could be processed.")
-        return {"CANCELLED"}
-
-    if skipped_no_shape_keys:
-        operator.report(
-            {"WARNING"},
-            f"Skipped objects without shape keys: {_summarize_names(skipped_no_shape_keys)}.",
-        )
-    if failures:
-        operator.report({"WARNING"}, f"Failed objects: {_summarize_names(failures)}.")
-
-    shape_key_count = sum(result["shape_key_count"] for _obj_name, result in results)
-    operator.report(
-        {"INFO"},
-        f"{action_label} {shape_key_count} shape key(s) on {len(results)} object(s).",
-    )
-    return {"FINISHED"}
-
-
 class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
-    """Apply enabled modifiers on meshes with shape keys without deleting them."""
+    """Apply enabled modifiers on every selected mesh, preserving any shape keys."""
 
     bl_idname = "mdt.apply_modifier_keep_shape_keys"
     bl_label = "Apply Enabled Modifiers"
     bl_description = (
-        "Apply every viewport-enabled modifier, including data-transfer and vertex-group changes, while rebuilding shape keys"
+        "Apply viewport-enabled modifiers on all selected meshes, preserving existing shape keys"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -94,13 +50,9 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
     def execute(self, context):
         selected_mesh_objects = get_selected_mesh_objects(context)
         eligible_objects = []
-        skipped_no_shape_keys = []
         skipped_no_modifiers = []
 
         for obj in selected_mesh_objects:
-            if not has_shape_keys(obj):
-                skipped_no_shape_keys.append(obj.name)
-                continue
             if len(get_enabled_modifier_names(obj)) == 0:
                 skipped_no_modifiers.append(obj.name)
                 continue
@@ -109,7 +61,7 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
         if len(eligible_objects) == 0:
             self.report(
                 {"ERROR"},
-                "Select at least one mesh object that has shape keys and viewport-enabled modifiers.",
+                "Select at least one mesh object with viewport-enabled modifiers.",
             )
             return {"CANCELLED"}
 
@@ -124,8 +76,8 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
         try:
             for obj in eligible_objects:
                 try:
-                    results.append((obj.name, apply_modifier_with_shape_keys(context, obj)))
-                except ValueError as exc:
+                    results.append((obj.name, apply_enabled_modifiers(context, obj)))
+                except (ValueError, RuntimeError) as exc:
                     failures.append(f"{obj.name}: {exc}")
         finally:
             restore_context_mode(previous_mode)
@@ -134,11 +86,6 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
             self.report({"ERROR"}, failures[0] if failures else "No selected object could be processed.")
             return {"CANCELLED"}
 
-        if skipped_no_shape_keys:
-            self.report(
-                {"WARNING"},
-                f"Skipped objects without shape keys: {_summarize_names(skipped_no_shape_keys)}.",
-            )
         if skipped_no_modifiers:
             self.report(
                 {"WARNING"},
@@ -170,12 +117,12 @@ class MDT_OT_apply_modifier_keep_shape_keys(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class MDT_OT_set_current_shape_key_values_as_zero(bpy.types.Operator):
-    """Make the current shape-key mix the new zero point."""
+class MDT_OT_apply_unlocked_shape_keys(bpy.types.Operator):
+    """Bake current unlocked shape-key contributions into Basis, then remove those keys."""
 
-    bl_idname = "mdt.set_shape_key_current_values_as_zero"
-    bl_label = "Current Values as Zero"
-    bl_description = "Move the current relative shape-key values into Basis, then shift every slider around the new zero"
+    bl_idname = "mdt.apply_unlocked_shape_keys"
+    bl_label = "Apply Unlocked Shape Keys"
+    bl_description = "Bake current unlocked shape-key values into Basis and remove those shape keys"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -183,30 +130,45 @@ class MDT_OT_set_current_shape_key_values_as_zero(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        return _execute_shape_key_range_operation(
-            self,
-            context,
-            set_current_shape_key_values_as_zero,
-            "Set current values as zero for",
+        target_objects, skipped_no_shape_keys = _selected_shape_key_objects(context)
+        if len(target_objects) == 0:
+            self.report({"ERROR"}, "Select at least one mesh object with shape keys.")
+            return {"CANCELLED"}
+
+        try:
+            previous_mode = ensure_object_mode(context)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not switch to Object Mode: {exc}")
+            return {"CANCELLED"}
+
+        results = []
+        failures = []
+        try:
+            for obj in target_objects:
+                try:
+                    results.append((obj.name, apply_unlocked_shape_keys(context, obj)))
+                except ValueError as exc:
+                    failures.append(f"{obj.name}: {exc}")
+        finally:
+            restore_context_mode(previous_mode)
+
+        if len(results) == 0:
+            self.report({"ERROR"}, failures[0] if failures else "No selected object could be processed.")
+            return {"CANCELLED"}
+
+        if skipped_no_shape_keys:
+            self.report(
+                {"WARNING"},
+                f"Skipped objects without shape keys: {_summarize_names(skipped_no_shape_keys)}.",
+            )
+        if failures:
+            self.report({"WARNING"}, f"Failed objects: {_summarize_names(failures)}.")
+
+        applied_shape_key_count = sum(result["applied_shape_key_count"] for _obj_name, result in results)
+        applied_value_count = sum(result["applied_value_count"] for _obj_name, result in results)
+        self.report(
+            {"INFO"},
+            f"Applied {applied_shape_key_count} unlocked shape key(s) on {len(results)} object(s). "
+            f"Baked {applied_value_count} current contribution(s).",
         )
-
-
-class MDT_OT_normalize_shape_key_ranges(bpy.types.Operator):
-    """Normalize every shape-key slider range to 0..1."""
-
-    bl_idname = "mdt.normalize_shape_key_ranges"
-    bl_label = "Normalize Ranges 0-1"
-    bl_description = "Remap each relative shape-key slider to 0..1 without changing the visible mesh"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, _context):
-        return True
-
-    def execute(self, context):
-        return _execute_shape_key_range_operation(
-            self,
-            context,
-            normalize_shape_key_ranges,
-            "Normalized ranges for",
-        )
+        return {"FINISHED"}

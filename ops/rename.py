@@ -126,7 +126,8 @@ class MDT_OT_clean_disconnected_vertex_group_weights(bpy.types.Operator):
             (
                 f"Cleaned {result['cleaned_group_count']} group(s), "
                 f"removed {result['removed_weight_count']} weight(s) from "
-                f"{result['removed_component_count']} island(s)."
+                f"{result['removed_component_count']} island(s), normalized "
+                f"{result['normalized_vertex_count']} vertex/vertices."
             ),
         )
         return {"FINISHED"}
@@ -251,6 +252,6 @@ class MDT_OT_mirror_vertex_group_weights(bpy.types.Operator):
             f"{result['pair_count']} pair(s), wrote {result['written_weight_count']} weight(s)."
         )
         if result["unmatched_vertex_count"] > 0:
-            message += f" Unmatched source vertices: {result['unmatched_vertex_count']}."
+            message += f" Unmatched target vertices: {result['unmatched_vertex_count']}."
         self.report({"INFO"}, message)
         return {"FINISHED"}

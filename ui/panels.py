@@ -14,6 +14,30 @@ class _MDT_PT_base:
     bl_category = "Mod Tool"
 
 
+class MDT_PT_mesh(_MDT_PT_base, bpy.types.Panel):
+    """Sidebar panel for mesh topology tools."""
+
+    bl_label = "Mesh"
+
+    @classmethod
+    def poll(cls, _context):
+        return True
+
+    def draw(self, context):
+        self.layout.operator("mdt.bridge_uv_loops", icon="AUTOMERGE_ON")
+        sculpt = context.scene.mdt_joint_sculpt_settings
+        box = self.layout.box()
+        box.label(text="Joint Sculpt", icon="SCULPTMODE_HLT")
+        if sculpt.sources or sculpt.proxy:
+            box.label(text=f"Objects: {len(sculpt.sources)}")
+            box.label(text="Keep topology unchanged.", icon="INFO")
+            row = box.row(align=True)
+            row.operator("mdt.apply_joint_sculpt", text="Apply", icon="CHECKMARK")
+            row.operator("mdt.cancel_joint_sculpt", text="Cancel", icon="X")
+        else:
+            box.operator("mdt.start_joint_sculpt", icon="SCULPTMODE_HLT")
+
+
 class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
     """Sidebar panel for vertex-group cleanup and rename tools."""
 
@@ -52,6 +76,16 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
             button_row = layout.row(align=True)
             button_row.operator("mdt.batch_rename_groups", icon="CHECKMARK")
             button_row.operator("mdt.reset_rename_settings", icon="LOOP_BACK")
+
+            auto_rig_settings = scene.mdt_group_match_settings
+            layout.prop(auto_rig_settings, "target_armature", text="Target Rig")
+            auto_rig_row = layout.row(align=True)
+            auto_rig_row.prop(auto_rig_settings, "rig_mapping", text="")
+            auto_rig_row.operator(
+                "mdt.auto_rig_npc",
+                text="Rename Selected",
+                icon="GROUP_VERTEX",
+            )
 
             cleanup_row = layout.row()
             cleanup_row.operator(
@@ -95,6 +129,13 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
         seam_row = layout.row()
         seam_row.operator("mdt.rename_selected_seam_groups", icon="MOD_VERTEX_WEIGHT")
 
+        seam_weight_row = layout.row()
+        seam_weight_row.operator("mdt.unify_seam_weights_from_target", icon="MOD_VERTEX_WEIGHT")
+
+        normal_row = layout.row(align=True)
+        normal_row.operator("mdt.merge_selected_vertex_normals_average", text="Normals Avg", icon="NORMALS_VERTEX")
+        normal_row.operator("mdt.merge_selected_vertex_normals_active", text="Normals Active", icon="NORMALS_VERTEX")
+
         mapping_settings = scene.mdt_group_match_settings
         source_obj, target_obj = resolve_group_mapping_objects(mapping_settings)
         mapping_box = layout.box()
@@ -111,14 +152,6 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
             and source_obj != target_obj
         )
         rename_row.operator("mdt.rename_groups_from_target", icon="CHECKMARK")
-
-        seam_weight_row = mapping_box.row()
-        seam_weight_row.enabled = (
-            source_obj is not None
-            and target_obj is not None
-            and source_obj != target_obj
-        )
-        seam_weight_row.operator("mdt.unify_seam_weights_from_target", icon="MOD_VERTEX_WEIGHT")
 
         mapping_box.label(text="Select Source and Target, then rename.", icon="INFO")
 
@@ -158,19 +191,8 @@ class MDT_PT_shape_keys(_MDT_PT_base, bpy.types.Panel):
         )
         action_row.operator("mdt.transfer_shape_keys", icon="MOD_MESHDEFORM")
 
-        range_box = layout.box()
-        range_box.label(text="Shape Key Ranges", icon="SHAPEKEY_DATA")
-        range_row = range_box.row(align=True)
-        range_row.operator(
-            "mdt.set_shape_key_current_values_as_zero",
-            text="Current Values as Zero",
-            icon="CHECKMARK",
-        )
-        range_row.operator(
-            "mdt.normalize_shape_key_ranges",
-            text="Normalize 0-1",
-            icon="CHECKMARK",
-        )
+        action_row = layout.row()
+        action_row.operator("mdt.apply_unlocked_shape_keys", text="Apply Unlocked Shape Keys", icon="CHECKMARK")
 
         action_row = layout.row()
         action_row.operator("mdt.apply_modifier_keep_shape_keys", text="Apply Enabled Modifiers", icon="CHECKMARK")
@@ -192,8 +214,64 @@ class MDT_PT_materials(_MDT_PT_base, bpy.types.Panel):
         create_row = layout.row()
         create_row.operator("mdt.create_named_materials", icon="MATERIAL")
 
+        sp_settings = context.scene.mdt_base_color_sp_settings
+        sp_box = layout.box()
+        sp_box.prop(sp_settings, "directory")
+        sp_box.prop(sp_settings, "grid_size")
+        sp_row = sp_box.row(align=True)
+        sp_row.operator("mdt.merge_base_color_for_sp", icon="TEXTURE")
+        sp_row.operator("mdt.restore_base_color_from_sp", icon="FILE_REFRESH")
+
+        bake = context.scene.mdt_color_bake_settings
+        bake_box = layout.box()
+        bake_box.label(text="Output Color Bake", icon="RENDER_STILL")
+        bake_box.label(text="Connect the color chain to Material Output.")
+        bake_box.operator("mdt.prepare_color_bake", icon="FILE_REFRESH")
+        obj = context.object
+        ready = is_mesh_object(obj) and bake.mesh_object == obj
+        if ready:
+            bake_box.prop_search(bake, "source_uv", obj.data, "uv_layers")
+            for item in bake.materials:
+                row = bake_box.row(align=True)
+                row.label(text=item.material.name if item.material else "Missing material")
+                row.prop_search(item, "target_uv", obj.data, "uv_layers", text="")
+        bake_box.prop(bake, "filepath")
+        row = bake_box.row(align=True)
+        row.prop(bake, "resolution")
+        row.prop(bake, "margin")
+        row = bake_box.row()
+        row.enabled = ready and len(bake.materials) > 0
+        row.operator("mdt.bake_output_colors", icon="RENDER_STILL")
+        if ready and bake.last_image:
+            bake_box.label(text=f"Result UV: {bake.last_uv}", icon="GROUP_UVS")
+
         split_row = layout.row()
         split_row.operator("mdt.separate_by_material", icon="MOD_EXPLODE")
+
+
+class MDT_PT_animation(_MDT_PT_base, bpy.types.Panel):
+    """File-based MMD body animation import."""
+
+    bl_label = "Animation / 动画"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.mdt_animation_settings
+        layout.prop(settings, "target_armature")
+        row = layout.row(align=True)
+        row.prop(settings, "translation_multiplier")
+        row.prop(settings, "start_frame")
+        row = layout.row()
+        row.enabled = settings.target_armature is not None
+        row.operator_context = "INVOKE_DEFAULT"
+        row.operator("mdt.import_mmd_animation", icon="ACTION")
+        layout.label(text="VPD: pose   VMD: motion", icon="INFO")
+        layout.label(text="Requires MMD Tools; body bones only.")
+        layout.label(text="Source stance: Tda Miku (EIEM)")
+        if settings.last_action:
+            layout.label(text=settings.last_action, icon="ACTION")
+            layout.label(text=settings.last_report)
 
 
 class MDT_PT_armature_cleanup(_MDT_PT_base, bpy.types.Panel):

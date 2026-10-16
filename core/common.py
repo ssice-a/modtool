@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from array import array
+import hashlib
 
 import bpy
 from mathutils import Vector
@@ -39,6 +40,28 @@ def sync_edit_mesh_data(obj):
     """Push edit-mode changes back to the mesh before reading geometry data."""
     if obj is not None and getattr(obj, "mode", "OBJECT") == "EDIT":
         obj.update_from_editmode()
+
+
+def mesh_topology_signature(mesh, include_edges=False):
+    """Hash vertex identities and polygon connectivity with bulk RNA reads."""
+    digest = hashlib.sha256()
+    digest.update(len(mesh.vertices).to_bytes(8, "little"))
+    digest.update(len(mesh.edges).to_bytes(8, "little"))
+    for elements, field, size in (
+        (mesh.loops, "vertex_index", len(mesh.loops)),
+        (mesh.polygons, "loop_start", len(mesh.polygons)),
+        (mesh.polygons, "loop_total", len(mesh.polygons)),
+    ):
+        values = array("i", [0]) * size
+        if size:
+            elements.foreach_get(field, values)
+        digest.update(values.tobytes())
+    if include_edges:
+        values = array("i", [0]) * (len(mesh.edges) * 2)
+        if values:
+            mesh.edges.foreach_get("vertices", values)
+        digest.update(values.tobytes())
+    return digest.hexdigest()
 
 
 def get_flat_point_coordinates(points):
