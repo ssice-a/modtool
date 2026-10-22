@@ -97,11 +97,11 @@ class MDT_OT_remove_empty_vertex_groups(bpy.types.Operator):
 
 
 class MDT_OT_clean_disconnected_vertex_group_weights(bpy.types.Operator):
-    """Keep each vertex group to its largest connected weight island."""
+    """Keep only the largest connected region in each vertex group."""
 
     bl_idname = "mdt.clean_disconnected_vertex_group_weights"
-    bl_label = "Clean Islands"
-    bl_description = "Remove disconnected weight islands from each vertex group, keeping the largest connected region"
+    bl_label = "Keep Largest Island"
+    bl_description = "Keep only the largest connected region per group; smaller islands are removed completely"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -121,15 +121,18 @@ class MDT_OT_clean_disconnected_vertex_group_weights(bpy.types.Operator):
             self.report({"INFO"}, "No disconnected weight islands were found.")
             return {"CANCELLED"}
 
-        self.report(
-            {"INFO"},
-            (
-                f"Cleaned {result['cleaned_group_count']} group(s), "
-                f"removed {result['removed_weight_count']} weight(s) from "
-                f"{result['removed_component_count']} island(s), normalized "
-                f"{result['normalized_vertex_count']} vertex/vertices."
-            ),
+        message = (
+            f"Cleaned {result['cleaned_group_count']} group(s), "
+            f"removed {result['removed_weight_count']} weight(s) from "
+            f"{result['removed_component_count']} island(s), normalized "
+            f"{result['normalized_vertex_count']} vertex/vertices."
         )
+        if result["unweighted_vertex_count"]:
+            message += (
+                f" {result['unweighted_vertex_count']} vertex/vertices "
+                "are now unweighted."
+            )
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 

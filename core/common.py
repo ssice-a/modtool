@@ -17,6 +17,7 @@ _MODE_RESTORE_MAP = {
     "SCULPT": "SCULPT",
     "VERTEX_PAINT": "VERTEX_PAINT",
     "WEIGHT_PAINT": "WEIGHT_PAINT",
+    "PAINT_WEIGHT": "WEIGHT_PAINT",
     "TEXTURE_PAINT": "TEXTURE_PAINT",
 }
 
@@ -69,6 +70,41 @@ def get_flat_point_coordinates(points):
     flat_coordinates = array("f", [0.0]) * (len(points) * 3)
     points.foreach_get("co", flat_coordinates)
     return flat_coordinates
+
+
+def mesh_coordinate_offset_plan(mesh, delta, *, coordinates=None, keys=None):
+    """Prepare rollback-capable bulk writes preserving every shape-key delta."""
+    from .materials import _require_numpy, np
+
+    _require_numpy("Mesh coordinate offsets")
+    if coordinates is None:
+        coordinates = np.frombuffer(get_flat_point_coordinates(mesh.vertices), dtype=np.float32).reshape(-1, 3)
+    if keys is None:
+        keys = [(key, np.frombuffer(get_flat_point_coordinates(key.data), dtype=np.float32).reshape(-1, 3))
+                for key in mesh.shape_keys.key_blocks] if mesh.shape_keys else []
+    targets = [(mesh.vertices, coordinates, coordinates + delta)]
+    targets.extend((key.data, values, values + delta) for key, values in keys)
+    return targets
+
+
+def triangle_barycentric_array(points, triangles):
+    """Batch barycentric coordinates for surface hits; return usable rows too."""
+    from .materials import np
+
+    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+    ab, ac, offset = b - a, c - a, points - a
+    dot = lambda x, y: np.einsum("ij,ij->i", x, y)
+    d00, d01, d11 = dot(ab, ab), dot(ab, ac), dot(ac, ac)
+    denominator = d00 * d11 - d01 * d01
+    usable = np.abs(denominator) > 1e-20
+    wb = np.zeros(len(points)); wc = np.zeros(len(points))
+    d20, d21 = dot(offset, ab), dot(offset, ac)
+    wb[usable] = (d11[usable] * d20[usable] - d01[usable] * d21[usable]) / denominator[usable]
+    wc[usable] = (d00[usable] * d21[usable] - d01[usable] * d20[usable]) / denominator[usable]
+    values = np.column_stack((1.0 - wb - wc, wb, wc))
+    np.clip(values, 0.0, 1.0, out=values)
+    values /= values.sum(axis=1, keepdims=True)
+    return values, usable
 
 
 def get_point_coordinates(points):

@@ -25,6 +25,12 @@ def _rig_mapping_items(self, context):
     return rig_mapping_items(self, context)
 
 
+def _proxy_fit_update(self, _context):
+    from .core.proxy_fit import sync_shrinkwrap
+
+    sync_shrinkwrap(self)
+
+
 class MDT_PG_AnimationSettings(bpy.types.PropertyGroup):
     """File and destination for standard MMD body retargeting."""
 
@@ -361,11 +367,61 @@ class MDT_PG_BoneMergeSettings(bpy.types.PropertyGroup):
     )
 
 
-class MDT_PG_JointSculptSelection(bpy.types.PropertyGroup):
+class MDT_PG_ProxyFitSettings(bpy.types.PropertyGroup):
+    """Persistent proxy correspondence; solving runs only on an explicit update."""
+
+    source: bpy.props.PointerProperty(name="Source Clothing", type=bpy.types.Object, poll=_mesh_object_poll)
+    target: bpy.props.PointerProperty(name="Target Body", type=bpy.types.Object, poll=_mesh_object_poll)
+    source_proxy: bpy.props.PointerProperty(type=bpy.types.Object)
+    target_proxy: bpy.props.PointerProperty(type=bpy.types.Object)
+    lattice: bpy.props.PointerProperty(type=bpy.types.Object)
+    proxy_faces: bpy.props.IntProperty(name="Proxy Face Budget", default=2000, min=100, max=50000,
+        description="Approximate triangle count for each editable control surface")
+    grid_detail: bpy.props.IntProperty(name="Lattice Resolution", default=12, min=3, max=24,
+        description="Control points on the longest world axis; set before binding")
+    smoothness: bpy.props.FloatProperty(name="Volume Smoothness", default=.5, min=.001, soft_max=10, max=100,
+        description="Higher values spread movement more coherently through nearby clothing layers")
+    strength: bpy.props.FloatProperty(name="Strength", default=1, min=0, max=1,
+        description="Preview deformation strength; may be reduced to avoid local lattice folding")
+    movement_space: bpy.props.EnumProperty(name="Movement Space", default="WORLD", items=(
+        ("WORLD", "World", "Constrain displacement along world axes"),
+        ("SOURCE", "Source Local", "Constrain displacement along the original clothing object's local axes"),
+    ))
+    movement_axes: bpy.props.BoolVectorProperty(name="Allowed Movement", size=3, subtype="XYZ", default=(True, True, True),
+        description="Axes along which clothing may deform; disable Z to keep every vertex's Z coordinate unchanged in the chosen space")
+    method: bpy.props.EnumProperty(name="Wrap Method", default="NEAREST_SURFACEPOINT", update=_proxy_fit_update,
+        items=tuple((i.identifier, i.name, i.description) for i in bpy.types.ShrinkwrapModifier.bl_rna.properties["wrap_method"].enum_items))
+    snap_mode: bpy.props.EnumProperty(name="Snap Mode", default="OUTSIDE_SURFACE", update=_proxy_fit_update,
+        items=tuple((i.identifier, i.name, i.description) for i in bpy.types.ShrinkwrapModifier.bl_rna.properties["wrap_mode"].enum_items))
+    offset: bpy.props.FloatProperty(name="Offset", default=.003, subtype="DISTANCE", unit="LENGTH", update=_proxy_fit_update)
+    source_group: bpy.props.StringProperty(name="Clothing Mask", update=_proxy_fit_update,
+        description="Optional vertex group on Source Clothing; zero-weight vertices stay fixed, including on Apply")
+    invert_source_group: bpy.props.BoolProperty(name="Invert Clothing Mask", update=_proxy_fit_update)
+    proxy_group: bpy.props.StringProperty(name="Proxy Vertex Group", update=_proxy_fit_update,
+        description="Optional Shrinkwrap control group painted on Source Proxy; use Clothing Mask for original mesh groups")
+    invert_group: bpy.props.BoolProperty(name="Invert Group", update=_proxy_fit_update)
+    project_x: bpy.props.BoolProperty(name="X", update=_proxy_fit_update)
+    project_y: bpy.props.BoolProperty(name="Y", update=_proxy_fit_update)
+    project_z: bpy.props.BoolProperty(name="Z", default=True, update=_proxy_fit_update)
+    positive: bpy.props.BoolProperty(name="Positive", default=True, update=_proxy_fit_update)
+    negative: bpy.props.BoolProperty(name="Negative", default=True, update=_proxy_fit_update)
+    project_limit: bpy.props.FloatProperty(name="Projection Limit", min=0, subtype="DISTANCE", unit="LENGTH", update=_proxy_fit_update)
+    owner: bpy.props.StringProperty()
+    wrap_name: bpy.props.StringProperty()
+    modifier_name: bpy.props.StringProperty()
+    selection: bpy.props.StringProperty()
+    previous_active: bpy.props.PointerProperty(type=bpy.types.Object)
+    report: bpy.props.StringProperty()
+    topology_hash: bpy.props.StringProperty()
+    grid_min: bpy.props.FloatVectorProperty(size=3)
+    grid_step: bpy.props.FloatVectorProperty(size=3)
+
+
+class MDT_PG_JointEditSelection(bpy.types.PropertyGroup):
     object: bpy.props.PointerProperty(type=bpy.types.Object)
 
 
-class MDT_PG_JointSculptSource(bpy.types.PropertyGroup):
+class MDT_PG_JointEditSource(bpy.types.PropertyGroup):
     object: bpy.props.PointerProperty(type=bpy.types.Object)
     mesh: bpy.props.PointerProperty(type=bpy.types.Mesh)
     mesh_users: bpy.props.IntProperty()
@@ -373,13 +429,21 @@ class MDT_PG_JointSculptSource(bpy.types.PropertyGroup):
     count: bpy.props.IntProperty()
     hidden: bpy.props.BoolProperty()
     state_hash: bpy.props.StringProperty()
+    weights_hash: bpy.props.StringProperty()
 
 
-class MDT_PG_JointSculptSettings(bpy.types.PropertyGroup):
+class MDT_PG_JointEditSettings(bpy.types.PropertyGroup):
+    mode: bpy.props.EnumProperty(
+        name="Edit Mode",
+        items=(("SCULPT", "Sculpt", "Sculpt the selected meshes together"),
+               ("WEIGHT_PAINT", "Weight Paint", "Paint shared vertex groups across the selected meshes")),
+        default="SCULPT",
+    )
+    group_schema: bpy.props.StringProperty()
     proxy: bpy.props.PointerProperty(type=bpy.types.Object)
     proxy_mesh: bpy.props.PointerProperty(type=bpy.types.Mesh)
-    sources: bpy.props.CollectionProperty(type=MDT_PG_JointSculptSource)
-    selection: bpy.props.CollectionProperty(type=MDT_PG_JointSculptSelection)
+    sources: bpy.props.CollectionProperty(type=MDT_PG_JointEditSource)
+    selection: bpy.props.CollectionProperty(type=MDT_PG_JointEditSelection)
     previous_active: bpy.props.PointerProperty(type=bpy.types.Object)
     previous_mode: bpy.props.StringProperty()
     view_layer_name: bpy.props.StringProperty()
@@ -400,21 +464,23 @@ REGISTERED_CLASSES = (
     MDT_PG_GroupMatchResultItem,
     MDT_PG_ShapeKeyTransferSettings,
     MDT_PG_BoneMergeSettings,
-    MDT_PG_JointSculptSelection,
-    MDT_PG_JointSculptSource,
-    MDT_PG_JointSculptSettings,
+    MDT_PG_ProxyFitSettings,
+    MDT_PG_JointEditSelection,
+    MDT_PG_JointEditSource,
+    MDT_PG_JointEditSettings,
 )
 
 
 def register_addon_properties():
     """Register addon PointerProperties and collections on Scene."""
     bpy.types.Scene.mdt_animation_settings = bpy.props.PointerProperty(type=MDT_PG_AnimationSettings)
+    bpy.types.Scene.mdt_proxy_fit_settings = bpy.props.PointerProperty(type=MDT_PG_ProxyFitSettings)
     bpy.types.Scene.mdt_pose_mirror_settings = bpy.props.PointerProperty(type=MDT_PG_PoseMirrorSettings)
     bpy.types.Scene.mdt_rename_settings = bpy.props.PointerProperty(type=MDT_PG_RenameSettings)
     bpy.types.Scene.mdt_group_match_settings = bpy.props.PointerProperty(type=MDT_PG_GroupMatchSettings)
     bpy.types.Scene.mdt_base_color_sp_settings = bpy.props.PointerProperty(type=MDT_PG_BaseColorSPSettings)
     bpy.types.Scene.mdt_color_bake_settings = bpy.props.PointerProperty(type=MDT_PG_ColorBakeSettings)
-    bpy.types.Scene.mdt_joint_sculpt_settings = bpy.props.PointerProperty(type=MDT_PG_JointSculptSettings)
+    bpy.types.Scene.mdt_joint_edit_settings = bpy.props.PointerProperty(type=MDT_PG_JointEditSettings)
     bpy.types.Scene.mdt_shape_key_settings = bpy.props.PointerProperty(type=MDT_PG_ShapeKeyTransferSettings)
     bpy.types.Scene.mdt_bone_merge_settings = bpy.props.PointerProperty(type=MDT_PG_BoneMergeSettings)
     bpy.types.Scene.mdt_group_match_results = bpy.props.CollectionProperty(type=MDT_PG_GroupMatchResultItem)
@@ -422,10 +488,12 @@ def register_addon_properties():
 
 def unregister_addon_properties():
     """Remove addon PointerProperties and collections from Scene."""
+    if hasattr(bpy.types.Scene, "mdt_proxy_fit_settings"):
+        del bpy.types.Scene.mdt_proxy_fit_settings
     if hasattr(bpy.types.Scene, "mdt_animation_settings"):
         del bpy.types.Scene.mdt_animation_settings
-    if hasattr(bpy.types.Scene, "mdt_joint_sculpt_settings"):
-        del bpy.types.Scene.mdt_joint_sculpt_settings
+    if hasattr(bpy.types.Scene, "mdt_joint_edit_settings"):
+        del bpy.types.Scene.mdt_joint_edit_settings
     if hasattr(bpy.types.Scene, "mdt_color_bake_settings"):
         del bpy.types.Scene.mdt_color_bake_settings
     if hasattr(bpy.types.Scene, "mdt_pose_mirror_settings"):

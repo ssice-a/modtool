@@ -1,4 +1,4 @@
-"""Fixed-topology native sculpting on a temporary union of independent meshes."""
+"""Native sculpt and weight painting on a fixed-topology temporary mesh union."""
 
 from __future__ import annotations
 
@@ -7,14 +7,66 @@ import json
 
 import bpy
 
-from .common import get_flat_point_coordinates, mesh_topology_signature, restore_context_mode
+from .common import get_flat_point_coordinates, mesh_coordinate_offset_plan, mesh_topology_signature, restore_context_mode
 from .materials import _require_numpy, np
+from .rename import _write_group_weight_array
+from .weights import (snapshot_weights as _weight_snapshot, write_weight_rows as _write_weight_rows,
+                      restore_weight_snapshot as _restore_weight_snapshot)
 
 
-_START = ".mdt_joint_sculpt_start"
-_IDS = ".mdt_joint_sculpt_id"
-_RENDER_UV = ".mdt_joint_sculpt_render"
+_START = ".mdt_joint_edit_start"
+_IDS = ".mdt_joint_edit_id"
+_RENDER_UV = ".mdt_joint_edit_render"
 _AUTOMASK = ("use_automasking_topology", "use_automasking_face_sets")
+
+
+def _seed_proxy_weights(proxy, objects, offsets, snapshots):
+    schema = {}
+    for snapshot in snapshots:
+        for name, locked in snapshot["groups"]:
+            schema[name] = schema.get(name, False) or locked
+    # Create unlocked, populate, then restore locks (locked groups are never painted).
+    for name in schema:
+        proxy.vertex_groups.new(name=name)
+    pending = {}
+    for (start, _count), snapshot in zip(offsets, snapshots):
+        for i, row in enumerate(snapshot["rows"]):
+            for name, value in row.items():
+                pending.setdefault(name, []).append((start + i, value))
+    for name, entries in pending.items():
+        values = np.asarray(entries, dtype=np.float64)
+        _write_group_weight_array(proxy.vertex_groups[name], values[:, 0].astype(np.int32), values[:, 1])
+    for name, locked in schema.items():
+        proxy.vertex_groups[name].lock_weight = locked
+    active = bpy.context.view_layer.objects.active
+    if active in objects and active.vertex_groups.active:
+        proxy.vertex_groups.active_index = proxy.vertex_groups.find(active.vertex_groups.active.name)
+    return list(schema.items())
+
+
+def _weight_plans(settings, proxy):
+    painted = _weight_snapshot(proxy)
+    initial = dict(json.loads(settings.group_schema))
+    current = dict(painted["groups"])
+    globally_used = {name for weights in painted["rows"] for name in weights}
+    empty_new = current.keys() - initial.keys() - globally_used
+    plans = []
+    for row in settings.sources:
+        snapshot = _weight_snapshot(row.object)
+        if snapshot["hash"] != row.weights_hash:
+            raise ValueError(f"{row.object.name}: original weights or group locks changed during Joint Edit; nothing was written.")
+        target = painted["rows"][row.start:row.start + row.count]
+        changed = [i for i, (old, new) in enumerate(zip(snapshot["rows"], target)) if old != new]
+        original = dict(snapshot["groups"])
+        used = {name for weights in target for name in weights}
+        # Preserve per-object order and untouched locks. Explicit proxy changes
+        # propagate even when a deleted or locked group contains no weights.
+        schema = [(name, current[name] if current[name] != initial[name] else locked)
+                  for name, locked in snapshot["groups"] if name in current]
+        schema.extend((name, locked) for name, locked in painted["groups"]
+                      if name not in original and (name in used or name in empty_new))
+        plans.append((row.object, snapshot, target, changed, schema))
+    return plans
 
 
 def _read(elements, field, width=1, dtype="int32"):
@@ -61,7 +113,7 @@ def _check_modifiers(obj):
         if not modifier.show_viewport:
             continue
         if modifier.type != "ARMATURE":
-            raise ValueError(f"{obj.name}: disable '{modifier.name}' before Joint Sculpt; this tool requires unchanged topology and supports Armature modifiers.")
+            raise ValueError(f"{obj.name}: disable '{modifier.name}' before Joint Edit; this tool requires unchanged topology and supports Armature modifiers.")
         armature_enabled |= modifier.object is not None
     return armature_enabled
 
@@ -95,7 +147,7 @@ def _original_displacements(context, plans):
                 continue
             probe = obj.copy()
             probes.append((obj, probe, delta, visible))
-            probe.name = "JointSculpt_DeformProbe"
+            probe.name = "JointEdit_DeformProbe"
             probe.animation_data_clear()
             probe.constraints.clear()
             probe.parent = None
@@ -160,11 +212,11 @@ def _original_displacements(context, plans):
 
 
 def _build_proxy(parts, frame_inverse):
-    mesh = bpy.data.meshes.new("JointSculpt_Mesh")
+    mesh = bpy.data.meshes.new("JointEdit_Mesh")
     try:
         uv_names = sorted({layer.name for obj, part in parts for layer in part.uv_layers})
         if len(uv_names) >= 8:
-            raise ValueError("Joint Sculpt needs one free UV slot for the combined render UV.")
+            raise ValueError("Joint Edit needs one free UV slot for the combined render UV.")
         vertices, edges, loops, starts, totals, smooth, material_indices = [], [], [], [], [], [], []
         masks, render_uvs = [], []
         uv_chunks = {name: [] for name in uv_names}
@@ -268,13 +320,18 @@ def _restore_session(context, settings):
         if owner:
             for field, value in backup.get(name, {}).items():
                 setattr(owner, field, value)
-    proxy, mesh = settings.proxy, settings.proxy_mesh
+    proxy = settings.proxy
+    # Native operations can replace the proxy mesh with a copy. Retain both
+    # references until the proxy and session pointers release their users.
+    meshes = {mesh for mesh in (settings.proxy_mesh, proxy.data if proxy and proxy.type == "MESH" else None)
+              if mesh is not None}
     settings.proxy = None
     settings.proxy_mesh = None
     if proxy:
         bpy.data.objects.remove(proxy, do_unlink=True)
-    if mesh and mesh.users == 0:
-        bpy.data.meshes.remove(mesh)
+    for mesh in meshes:
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
     for obj in list(context.selected_objects):
         obj.select_set(False)
     for obj in selected:
@@ -290,31 +347,34 @@ def _restore_session(context, settings):
     settings.topology_hash = ""
     settings.brush = None
     settings.automasking_backup = ""
+    settings.group_schema = ""
     restore_context_mode(previous_mode)
 
 
-def start_joint_sculpt(context, objects, previous_mode):
-    _require_numpy("Joint Sculpt")
-    settings = context.scene.mdt_joint_sculpt_settings
+def start_joint_edit(context, objects, previous_mode):
+    _require_numpy("Joint Edit")
+    settings = context.scene.mdt_joint_edit_settings
     if settings.sources or settings.proxy:
-        raise ValueError("Apply or cancel the existing Joint Sculpt session first.")
+        raise ValueError("Apply or cancel the existing Joint Edit session first.")
     if len(objects) < 2:
-        raise ValueError("Select at least two mesh objects for Joint Sculpt.")
+        raise ValueError("Select at least two mesh objects for Joint Edit.")
     if context.object not in objects:
         raise ValueError("Make one of the selected mesh objects active.")
     snapshots = []
+    weight_snapshots = []
     for obj in objects:
         if not obj.is_editable or not obj.data.is_editable:
             raise ValueError(f"{obj.name}: the mesh is not editable.")
         if obj.data.users - int(obj.data.use_fake_user) > 1:
-            raise ValueError(f"{obj.name}: make the mesh data single-user before Joint Sculpt.")
+            raise ValueError(f"{obj.name}: make the mesh data single-user before Joint Edit.")
         if not len(obj.data.vertices) or not len(obj.data.polygons):
-            raise ValueError(f"{obj.name}: Joint Sculpt requires a surface mesh.")
+            raise ValueError(f"{obj.name}: Joint Edit requires a surface mesh.")
         if abs(np.linalg.det(np.asarray(obj.matrix_world)[:3, :3])) < 1e-12:
             raise ValueError(f"{obj.name}: zero scale cannot be mapped back.")
         _check_modifiers(obj)
         snapshot = _geometry_snapshot(obj)
         snapshots.append((snapshot[2], snapshot[3]))
+        weight_snapshots.append(_weight_snapshot(obj))
     location, rotation, _scale = context.object.matrix_world.decompose()
     frame = rotation.to_matrix().to_4x4()
     frame.translation = location
@@ -339,19 +399,21 @@ def start_joint_sculpt(context, objects, previous_mode):
         settings.selection.add().object = obj
     settings.proxy_mesh = mesh
     try:
-        proxy = bpy.data.objects.new("JointSculpt", mesh)
+        proxy = bpy.data.objects.new("JointEdit", mesh)
         settings.proxy = proxy
         proxy.matrix_world = frame
         proxy.hide_render = True
         context.collection.objects.link(proxy)
+        settings.group_schema = json.dumps(_seed_proxy_weights(proxy, objects, offsets, weight_snapshots))
         space = context.space_data
         if space and space.type == "VIEW_3D" and space.local_view:
             proxy.local_view_set(space, True)
-        for obj, (start, count), (state_hash, _topology) in zip(objects, offsets, snapshots):
+        for obj, (start, count), (state_hash, _topology), weights in zip(objects, offsets, snapshots, weight_snapshots):
             row = settings.sources.add()
             row.object, row.mesh = obj, obj.data
             row.mesh_users = obj.data.users
             row.start, row.count, row.state_hash = start, count, state_hash
+            row.weights_hash = weights["hash"]
             row.hidden = obj.hide_get()
             obj.hide_set(True)
         for obj in list(context.selected_objects):
@@ -361,44 +423,51 @@ def start_joint_sculpt(context, objects, previous_mode):
         settings.topology_hash = mesh_topology_signature(mesh, include_edges=True)
         settings.proxy_matrix = np.asarray(frame, dtype=np.float64).ravel()
         _set_automasking(context, settings)
-        bpy.ops.object.mode_set(mode="SCULPT")
+        bpy.ops.object.mode_set(mode=settings.mode)
         return {"object_count": len(objects), "vertex_count": len(mesh.vertices), "proxy": proxy}
     except Exception:
         _restore_session(context, settings)
         raise
 
 
-def apply_joint_sculpt(context):
-    _require_numpy("Joint Sculpt")
-    settings = context.scene.mdt_joint_sculpt_settings
+def apply_joint_edit(context):
+    _require_numpy("Joint Edit")
+    settings = context.scene.mdt_joint_edit_settings
     proxy = settings.proxy
-    if not settings.sources or not proxy or proxy.data != settings.proxy_mesh:
-        raise ValueError("The Joint Sculpt proxy is missing. Cancel the session to restore the original objects.")
+    if not settings.sources or not proxy or proxy.type != "MESH" or not settings.proxy_mesh:
+        raise ValueError("The Joint Edit proxy is missing. Cancel the session to restore the original objects.")
     if context.view_layer.name != settings.view_layer_name:
-        raise ValueError("Return to the view layer where Joint Sculpt started before applying.")
+        raise ValueError("Return to the view layer where Joint Edit started before applying.")
     mesh = proxy.data
     if proxy.use_dynamic_topology_sculpting or mesh_topology_signature(mesh, include_edges=True) != settings.topology_hash:
-        raise ValueError("Joint Sculpt topology changed. Undo the topology change or cancel; original objects have not been modified.")
+        raise ValueError("Joint Edit topology changed. Undo the topology change or cancel; original objects have not been modified.")
     ids, start = mesh.attributes.get(_IDS), mesh.attributes.get(_START)
-    if ids is None or start is None or not np.array_equal(_read(ids.data, "value"), np.arange(len(mesh.vertices))):
-        raise ValueError("Joint Sculpt vertex correspondence was changed; original objects have not been modified.")
+    if (ids is None or ids.domain != "POINT" or ids.data_type != "INT"
+            or start is None or start.domain != "POINT" or start.data_type != "FLOAT_VECTOR"
+            or not np.array_equal(_read(ids.data, "value"), np.arange(len(mesh.vertices)))):
+        raise ValueError("Joint Edit vertex correspondence was changed; original objects have not been modified.")
+    start_positions = _read(start.data, "vector", 3, np.float32)
+    if mesh != settings.proxy_mesh:
+        original_start = settings.proxy_mesh.attributes.get(_START)
+        if (original_start is None or original_start.domain != "POINT" or original_start.data_type != "FLOAT_VECTOR"
+                or not np.array_equal(start_positions, _read(original_start.data, "vector", 3, np.float32))):
+            raise ValueError("Joint Edit starting vertex correspondence was changed in the replacement mesh; original objects have not been modified.")
     matrix = np.asarray(proxy.matrix_world, dtype=np.float64)
     if not np.allclose(matrix.ravel(), settings.proxy_matrix, atol=1e-7, rtol=0):
         raise ValueError("The proxy object transform changed. Restore its transform before applying vertex edits.")
-    start_positions = _read(start.data, "vector", 3, np.float32)
     delta = _coordinates(mesh.vertices) - start_positions
     if not np.isfinite(delta).all():
-        raise ValueError("Joint Sculpt contains invalid vertex coordinates.")
+        raise ValueError("Joint Edit contains invalid vertex coordinates.")
     plans = []
     depsgraph = context.evaluated_depsgraph_get()
     for row in settings.sources:
         obj = row.object
         if not obj or obj.data != row.mesh or obj.data.users != row.mesh_users:
-            raise ValueError("An original object or its mesh data changed. Cancel Joint Sculpt; nothing has been written back.")
+            raise ValueError("An original object or its mesh data changed. Cancel Joint Edit; nothing has been written back.")
         armature_enabled = _check_modifiers(obj)
         coordinates, keys, state_hash, _topology = _geometry_snapshot(obj)
         if state_hash != row.state_hash:
-            raise ValueError(f"{obj.name}: original geometry, transforms or shape-key state changed during Joint Sculpt.")
+            raise ValueError(f"{obj.name}: original geometry, transforms or shape-key state changed during Joint Edit.")
         transform = np.linalg.inv(np.asarray(obj.matrix_world, dtype=np.float64))[:3, :3] @ matrix[:3, :3]
         evaluated_delta = (delta[row.start:row.start + row.count] @ transform.T).astype(np.float32)
         visible = None
@@ -407,8 +476,9 @@ def apply_joint_sculpt(context):
             to_proxy = np.linalg.inv(matrix) @ np.asarray(obj.matrix_world, dtype=np.float64)
             current = visible @ to_proxy[:3, :3].T + to_proxy[:3, 3]
             if not np.allclose(current, start_positions[row.start:row.start + row.count], atol=2e-6, rtol=1e-6):
-                raise ValueError(f"{obj.name}: bone deformation changed during Joint Sculpt. Restore the starting pose or cancel.")
+                raise ValueError(f"{obj.name}: bone deformation changed during Joint Edit. Restore the starting pose or cancel.")
         plans.append((obj, coordinates, keys, evaluated_delta, visible))
+    weight_plans = _weight_plans(settings, proxy)
     # Build all write plans before changing any geometry. Preserve key values,
     # relative deltas and the modifier stack; do not bake the posed mesh into Basis.
     writes = []
@@ -417,11 +487,11 @@ def apply_joint_sculpt(context):
         local_delta = displacements.get(obj, evaluated_delta)
         targets = []
         if np.any(local_delta):
-            targets.append((obj.data.vertices, coordinates, coordinates + local_delta))
-            targets.extend((key.data, values, values + local_delta) for key, values in keys)
+            targets = mesh_coordinate_offset_plan(obj.data, local_delta, coordinates=coordinates, keys=keys)
         writes.append((obj, targets, visible + evaluated_delta if visible is not None else None))
     # Validate every object before writing any. Retain old arrays for rollback if an
     # RNA write fails, so applying cannot leave only some objects updated.
+    weight_writes = []
     try:
         for obj, targets, _expected in writes:
             for points, old, new in targets:
@@ -436,7 +506,15 @@ def apply_joint_sculpt(context):
                     actual = _evaluated_coordinates(obj, depsgraph)
                     if not np.isfinite(actual).all() or not np.allclose(actual, expected, atol=3e-6, rtol=1e-6):
                         raise ValueError(f"{obj.name}: bone deformation could not reproduce the sculpt. Original geometry was restored; the sculpt session is retained.")
+        # Invert sculpt displacements using the starting weights, then install the
+        # painted weights. Their new deformation must not be baked into Basis.
+        for obj, snapshot, target, changed, schema in weight_plans:
+            if changed or snapshot["groups"] != schema:
+                weight_writes.append((obj, snapshot))
+                _write_weight_rows(obj, target, changed, schema)
     except Exception:
+        for obj, snapshot in reversed(weight_writes):
+            _restore_weight_snapshot(obj, snapshot)
         for obj, targets, _expected in writes:
             for points, old, new in targets:
                 points.foreach_set("co", old.ravel())
@@ -444,13 +522,14 @@ def apply_joint_sculpt(context):
                 obj.data.update()
         context.view_layer.update()
         raise
-    result = {"object_count": len(plans), "changed_vertices": int(np.count_nonzero(np.any(delta != 0, axis=1)))}
+    result = {"object_count": len(plans), "changed_vertices": int(np.count_nonzero(np.any(delta != 0, axis=1))),
+              "painted_vertices": sum(len(changed) for _obj, _old, _new, changed, _schema in weight_plans)}
     _restore_session(context, settings)
     return result
 
 
-def cancel_joint_sculpt(context):
-    settings = context.scene.mdt_joint_sculpt_settings
+def cancel_joint_edit(context):
+    settings = context.scene.mdt_joint_edit_settings
     if not settings.sources and not settings.proxy:
-        raise ValueError("No Joint Sculpt session is active.")
+        raise ValueError("No Joint Edit session is active.")
     _restore_session(context, settings)

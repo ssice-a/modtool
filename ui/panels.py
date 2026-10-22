@@ -25,17 +25,85 @@ class MDT_PT_mesh(_MDT_PT_base, bpy.types.Panel):
 
     def draw(self, context):
         self.layout.operator("mdt.bridge_uv_loops", icon="AUTOMERGE_ON")
-        sculpt = context.scene.mdt_joint_sculpt_settings
+        editing = context.scene.mdt_joint_edit_settings
         box = self.layout.box()
-        box.label(text="Joint Sculpt", icon="SCULPTMODE_HLT")
-        if sculpt.sources or sculpt.proxy:
-            box.label(text=f"Objects: {len(sculpt.sources)}")
+        box.label(text="Joint Edit", icon="EDITMODE_HLT")
+        if editing.sources or editing.proxy:
+            box.label(text=f"Objects: {len(editing.sources)}")
+            if editing.proxy:
+                row = box.row(align=True)
+                row.operator("mdt.switch_joint_edit_mode", text="Sculpt", depress=context.mode == "SCULPT").mode = "SCULPT"
+                row.operator("mdt.switch_joint_edit_mode", text="Weight Paint", depress=context.mode == "PAINT_WEIGHT").mode = "WEIGHT_PAINT"
+                if context.mode == "PAINT_WEIGHT":
+                    box.template_list("MESH_UL_vgroups", "joint_edit", editing.proxy, "vertex_groups", editing.proxy.vertex_groups, "active_index", rows=4)
             box.label(text="Keep topology unchanged.", icon="INFO")
             row = box.row(align=True)
-            row.operator("mdt.apply_joint_sculpt", text="Apply", icon="CHECKMARK")
-            row.operator("mdt.cancel_joint_sculpt", text="Cancel", icon="X")
+            row.operator("mdt.apply_joint_edit", text="Apply", icon="CHECKMARK")
+            row.operator("mdt.cancel_joint_edit", text="Cancel", icon="X")
         else:
-            box.operator("mdt.start_joint_sculpt", icon="SCULPTMODE_HLT")
+            box.prop(editing, "mode", expand=True)
+            box.operator("mdt.start_joint_edit", icon="EDITMODE_HLT")
+
+
+class MDT_PT_proxy_fit(_MDT_PT_base, bpy.types.Panel):
+    bl_label = "Proxy Shrinkwrap / 代理缩裹"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mdt_proxy_fit_settings
+        row = layout.column(align=True)
+        row.enabled = not s.owner
+        row.prop(s, "source")
+        row.prop(s, "target")
+        if not s.owner:
+            layout.label(text="Or select two meshes; target active.", icon="INFO")
+            layout.prop(s, "proxy_faces")
+            layout.operator("mdt.proxy_fit", text="Create Proxies / 创建代理", icon="MESH_ICOSPHERE").action = "CREATE"
+            return
+        row = layout.row(align=True)
+        row.operator("mdt.proxy_fit", text="Source Proxy", icon="RESTRICT_SELECT_OFF").action = "SOURCE"
+        row.operator("mdt.proxy_fit", text="Target Proxy", icon="RESTRICT_SELECT_OFF").action = "TARGET"
+        layout.prop(s, "method")
+        if s.method in {"NEAREST_SURFACEPOINT", "PROJECT", "TARGET_PROJECT"}:
+            layout.prop(s, "snap_mode")
+        layout.prop(s, "offset")
+        if s.method == "PROJECT":
+            row = layout.row(align=True)
+            for axis in ("project_x", "project_y", "project_z"):
+                row.prop(s, axis, toggle=True)
+            row = layout.row(align=True)
+            row.prop(s, "positive")
+            row.prop(s, "negative")
+            layout.prop(s, "project_limit")
+        if s.source:
+            layout.prop_search(s, "source_group", s.source, "vertex_groups")
+            if s.source_group:
+                layout.prop(s, "invert_source_group")
+        if s.source_proxy:
+            layout.prop_search(s, "proxy_group", s.source_proxy, "vertex_groups")
+            if s.proxy_group:
+                layout.prop(s, "invert_group")
+        row = layout.row()
+        row.enabled = s.lattice is None
+        row.prop(s, "grid_detail")
+        layout.prop(s, "smoothness")
+        layout.prop(s, "strength")
+        layout.prop(s, "movement_space")
+        layout.prop(s, "movement_axes", text="Allowed Movement", toggle=True)
+        if s.lattice:
+            layout.label(text="Edit proxies, then Update Preview.", icon="INFO")
+            layout.operator("mdt.proxy_fit", text="Update Preview / 更新预览", icon="FILE_REFRESH").action = "UPDATE"
+            row = layout.row(align=True)
+            row.operator("mdt.proxy_fit", text="Apply / 应用", icon="CHECKMARK").action = "APPLY"
+            row.operator("mdt.proxy_fit", text="Unbind / 解绑").action = "UNBIND"
+        else:
+            layout.label(text="Edit proxies before binding.", icon="INFO")
+            layout.operator("mdt.proxy_fit", text="Bind & Preview / 绑定预览", icon="MOD_LATTICE").action = "BIND"
+        layout.operator("mdt.proxy_fit", text="Cancel / 取消", icon="X").action = "CANCEL"
+        if s.report:
+            for line in s.report.split("; "):
+                layout.label(text=line)
 
 
 class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
@@ -95,7 +163,7 @@ class MDT_PT_vertex_groups(_MDT_PT_base, bpy.types.Panel):
             )
             cleanup_row.operator(
                 "mdt.clean_disconnected_vertex_group_weights",
-                text="Clean Islands",
+                text="Largest Island",
                 icon="BRUSH_DATA",
             )
             keep_row = layout.row()

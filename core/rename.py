@@ -9,7 +9,7 @@ import numpy as np
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-from .common import is_armature_object, sync_edit_mesh_data
+from .common import is_armature_object, sync_edit_mesh_data, triangle_barycentric_array
 
 
 _WEIGHT_EPSILON = 1.0e-8
@@ -389,11 +389,14 @@ def clean_disconnected_vertex_group_weights(obj):
         if len(components) <= 1:
             continue
 
+        # The main island is a spatial/topological region, not the region
+        # carrying the largest summed weight.  A tiny fragment can otherwise
+        # win merely because its few vertices have large weights.
         keep_index = max(
             range(len(components)),
             key=lambda component_index: (
-                components[component_index][0],
                 components[component_index][1],
+                components[component_index][0],
             ),
         )
         for component_index, _component in enumerate(components):
@@ -404,40 +407,6 @@ def clean_disconnected_vertex_group_weights(obj):
             removals_by_group_index.setdefault(group.index, set()).update(component_vertices)
 
     deform_group_by_index = _resolve_deforming_group_map(obj)
-    preserved_last_weight_count = 0
-    deform_removal_vertices = set().union(
-        *(
-            vertex_indices
-            for group_index, vertex_indices in removals_by_group_index.items()
-            if group_index in deform_group_by_index
-        ),
-        set(),
-    )
-    for vertex_index in deform_removal_vertices:
-        assignments = [
-            assignment
-            for assignment in obj.data.vertices[vertex_index].groups
-            if assignment.group in deform_group_by_index and assignment.weight > _WEIGHT_EPSILON
-        ]
-        remaining_total = sum(
-            assignment.weight
-            for assignment in assignments
-            if vertex_index not in removals_by_group_index.get(assignment.group, ())
-        )
-        if remaining_total > _WEIGHT_EPSILON:
-            continue
-
-        removable_assignments = [
-            assignment
-            for assignment in assignments
-            if vertex_index in removals_by_group_index.get(assignment.group, ())
-        ]
-        if not removable_assignments:
-            continue
-        preserved_assignment = max(removable_assignments, key=lambda assignment: assignment.weight)
-        removals_by_group_index[preserved_assignment.group].discard(vertex_index)
-        preserved_last_weight_count += 1
-
     affected_deform_vertices = set()
     removed_weight_count = 0
     cleaned_group_count = 0
@@ -463,7 +432,7 @@ def clean_disconnected_vertex_group_weights(obj):
         "removed_weight_count": removed_weight_count,
         "removed_component_count": removed_component_count,
         "normalized_vertex_count": normalization_result["normalized_vertex_count"],
-        "preserved_last_weight_count": preserved_last_weight_count,
+        "unweighted_vertex_count": normalization_result["unweighted_vertex_count"],
     }
 
 
@@ -938,19 +907,8 @@ def _build_surface_mirror_samples(mesh, coordinates, source_sign, tolerance):
     rows = np.asarray(hit_rows, dtype=np.int32)
     if len(rows):
         a, b, c = (coordinates[sample_indices[rows, i]] for i in range(3))
-        ab, ac, offset = b - a, c - a, np.asarray(hit_points) - a
-        dot = lambda x, y: np.einsum("ij,ij->i", x, y)
-        d00, d01, d11 = dot(ab, ab), dot(ab, ac), dot(ac, ac)
-        denominator = d00 * d11 - d01 * d01
-        usable = np.abs(denominator) > 1e-20
-        wb = np.zeros(len(rows)); wc = np.zeros(len(rows))
-        wb[usable] = (d11[usable] * dot(offset, ab)[usable]
-                      - d01[usable] * dot(offset, ac)[usable]) / denominator[usable]
-        wc[usable] = (d00[usable] * dot(offset, ac)[usable]
-                      - d01[usable] * dot(offset, ab)[usable]) / denominator[usable]
-        values = np.column_stack((1.0 - wb - wc, wb, wc))
-        np.clip(values, 0.0, 1.0, out=values)
-        values /= values.sum(axis=1, keepdims=True)
+        ab, ac = b - a, c - a
+        values, usable = triangle_barycentric_array(np.asarray(hit_points), coordinates[sample_indices[rows]])
         barycentric[rows] = values
         distances[rows[~usable]] = np.inf
         if tolerance <= 0.0:

@@ -5,7 +5,7 @@ This Blender add-on focuses on a few practical mesh workflows that are common wh
 ## Features
 
 - Target-preserving welding of two closed boundary loops with different vertex counts
-- Joint sculpting of selected independent meshes with native brushes and fixed topology
+- Joint editing of selected meshes with native sculpt and weight-paint brushes and fixed topology
 - Reversible Base Color material preparation for Substance Painter
 - Vertex-group renaming with rule-based and sequential modes
 - Spatial vertex-group name mapping from a source mesh to a target mesh
@@ -53,13 +53,26 @@ Locked groups that would change stop the operation before any weight is written.
 Unmatched destination vertices are reported and retained. Spatial data and NumPy
 weight arrays are rebuilt per operation; repainting invalidates a persistent cache.
 
-### Joint Sculpt
+### Joint Edit
 
-Select at least two meshes, then click `Mesh > Joint Sculpt > Start Joint Sculpt`.
+Select at least two meshes, choose `Sculpt` or `Weight Paint`, then click
+`Mesh > Joint Edit > Start Joint Edit`. During the session, use the two mode
+buttons to switch between sculpting and weight painting. In Weight Paint,
+choose the active vertex group from the panel's list; groups with the same
+name are shared across all selected meshes, regardless of their group order.
 A temporary mesh combines their current shape using the active object's origin
 and orientation, with unit scale. Original objects are hidden while native Blender brushes edit the union.
-`Apply` writes vertex displacements back to the originals; `Cancel` discards them.
-Original objects stay separate. UVs, material slots, weights, shape-key values and
+`Apply` writes vertex displacements and painted weights back to the originals;
+`Cancel` discards both. New groups are created only on originals that receive
+nonzero weights. Explicitly added empty groups are kept on all originals.
+Renaming, deleting, adding, merging and locking/unlocking groups on the proxy
+are supported. Apply copies the final named weights and removes deleted groups
+from the originals, including empty groups. Erased weights are removed, and no
+extra normalization runs on Apply. Shared groups are initially locked if any
+source locks them; unchanged source locks are retained individually, while
+explicit proxy lock changes propagate. Changes to hidden source weights during
+the session are rejected before writes.
+Original objects stay separate. UVs, material slots, shape-key values and
 modifiers are retained. Shape-key coordinates all receive the same local vertex
 displacement, preserving differences between keys without baking their current
 values into Basis. Armature modifiers can stay enabled in the current pose.
@@ -67,6 +80,9 @@ values into Basis. Armature modifiers can stay enabled in the current pose.
 sculpt displacement back to the original mesh, and checks that the evaluated
 result matches the sculpt. Bone rotation, scale, blended weights, modifier
 influence masks and Preserve Volume are included.
+Painted weights are applied after that check, so their new bone deformation is
+not baked into mesh or shape-key coordinates. The painting surface stays in
+the starting pose; Apply restores the original Armature-driven preview.
 
 This version requires fixed topology and single-user editable mesh data. Other
 enabled modifiers must be disabled first. Dynamic topology, remeshing, changed
@@ -81,8 +97,11 @@ switching brushes. Sculpt masks are retained. Separate seam vertices are not
 welded or synchronized by this tool.
 
 Session references and initial positions are stored in Blender data so normal
-undo and saved sessions do not rely on a Python global cache. No mesh scans or
-Python handlers run during brush strokes; NumPy bulk transforms run at start and
+undo and saved sessions do not rely on a Python global cache. A native operation
+may replace the proxy mesh with a copy; Apply accepts it only when topology,
+vertex IDs and stored starting positions remain intact. Apply and Cancel clean
+up both unused proxy meshes. No mesh scans or
+Python handlers run during brush strokes; sparse weight collection and NumPy bulk transforms run at start and
 apply. Inverse skinning uses three batched coordinate probes only when applying
 edited vertices; no persistent deformation cache is used. Materials using explicit
 UV maps retain those maps; implicit UV sampling
@@ -215,6 +234,81 @@ Retargeting uses in-memory NumPy batches and bulk F-Curve writes. It does not
 scan meshes or install frame-change handlers. Persistent `.npy` caching is
 omitted because motion files, rest bones and settings can change between imports.
 Source attribution and AGPL terms are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+### Proxy Shrinkwrap / 代理缩裹
+
+`Mod Tool > Proxy Shrinkwrap / 代理缩裹` fits thick or layered clothing through
+editable low-resolution surfaces and a single native Lattice modifier.
+
+1. Choose `Source Clothing` and `Target Body`, or select two meshes with the
+   target active. Align them in modeling/rest space first. `Create Proxies`
+   creates independent source and target control surfaces; the originals stay intact.
+2. Use `Source Proxy` / `Target Proxy` to select and edit either helper.
+   Before binding, source proxy topology can also be edited. Create or paint an
+   optional group on **Source Proxy**, then select it in `Proxy Vertex Group`.
+   To restrict the actual clothing deformation, select an existing original-mesh
+   group in `Clothing Mask`. Its zero-weight vertices stay fixed, fractional
+   weights blend the movement once, and inversion is supported. Apply preserves
+   the same masked result. The proxy control mask and clothing mask are independent.
+3. Choose the native Shrinkwrap method, snap mode, offset and projection axes.
+   Set `Lattice Resolution`, then click `Bind & Preview`.
+   `Allowed Movement` separately constrains the final clothing displacement:
+   enable X/Y and disable Z to retain every vertex's Z coordinate. Choose
+   `World` or `Source Local` for rotated objects. These controls affect the volume
+   field; native projection axes choose which rays search for the target.
+   The constraint preserves coordinates along the locked axis, not the arc length
+   of a curved sleeve. Like the other fitting settings, changes take effect on
+   `Update Preview` and remain in effect when applying.
+4. Edit the proxies, masks or settings and click `Update Preview` to update the
+   clothing. Increasing `Volume Smoothness` spreads movement more coherently;
+   increasing lattice resolution allows finer local changes. To change the source
+   proxy topology or lattice resolution after binding, `Unbind`, edit, then bind again.
+5. `Apply` writes the current per-vertex movement into the original mesh and all
+   its shape keys, retaining their relative differences, values and animation.
+   UVs, topology, materials, weights and existing modifiers stay intact. Shared
+   mesh data is made independent on Apply. `Cancel` removes this session's helpers
+   and preview without changing original coordinates. Both actions restore the
+   initial object selection. A bound preview also survives saving/reloading the file.
+
+Proxy reduction uses native edge collapse rather than spatial vertex clustering,
+so nearby disconnected clothing layers are not welded into a single control
+surface. Reduction runs only when creating proxies, not during UI drawing or fitting.
+Existing simplified proxies are not automatically rebuilt; recreate them to use
+the updated reduction, preserving any manual helper edits first.
+
+Proxies use the current shape-key mix **before all modifiers**, including Armature.
+The preview lattice is first in the clothing's modifier stack, so an animated
+pose is not baked into the clothing. For modeling, inspect the aligned rest pose;
+posed source/target silhouettes are deliberately not used to generate proxies.
+Apply preserves original shape-key deltas, rather than independently deforming
+each key through the nonlinear lattice. Other key values therefore retain their
+original offsets from the fitted shape.
+
+Each source proxy point supplies a displacement from its stored bind position.
+A regularized, matrix-free NumPy solve fits these displacements to an anisotropic
+trilinear lattice. Nearby clothing layers share this smooth volume field instead
+of being individually snapped onto the body. Proxy masks control the Shrinkwrap
+constraints; the volume field feathers movement into neighboring regions.
+The report includes fitting error and effective strength; strength is reduced
+when sampled lattice Jacobians approach folding or extreme compression.
+
+This is a fitting tool, not a cloth collision solver. Strong compression can still
+change thickness; it does not guarantee exact layer spacing or collision-free
+results. Opposite limbs or clothing layers closer than the proxy/grid resolution
+can share controls. Inspect the simplified proxies and increase resolution or
+restrict their masks when needed. Target Normal Project depends on consistent
+target proxy normals. Original modifiers are intentionally excluded, so apply any
+modeling modifier whose geometry you want represented before creating proxies.
+
+All heavy reads/writes use bulk arrays. Explicit updates avoid installing a
+Python handler during every drag or paint stroke; previews then use Blender's
+native lattice evaluation. No persistent numeric cache is used because proxy
+geometry, masks and settings remain editable. The bounded proxy budget and
+matrix-free solver avoid a dense high-resolution binding matrix.
+
+Workflow reference: [EZ Lattice](https://github.com/kursad-k/ezlattice), for the
+bounding lattice / apply / clear interaction. No implementation code is copied;
+proxy reduction and the displacement-field fitter are implemented here.
 
 ## Code Layout
 
